@@ -9,7 +9,7 @@ import multiprocess as mp
 import threading
 from threading import Lock
 
-from nclaw.utils import get_root
+from utils import get_root
 root: Path = get_root(__file__)
 
 from camera.multi_realsense import MultiRealsense

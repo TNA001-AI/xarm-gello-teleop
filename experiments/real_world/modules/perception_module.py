@@ -17,8 +17,7 @@ from groundingdino.util.utils import clean_state_dict, get_phrases_from_posmap
 from utils.pcd_utils import visualize_o3d, depth2fgpcd
 from modules.robot_env import get_bounding_box
 
-import nclaw
-from nclaw.utils import get_root
+from utils import get_root
 import sys
 root: Path = get_root(__file__)
 

@@ -18,7 +18,7 @@ from utils.pcd_utils import depth2fgpcd, rpy_to_rotation_matrix
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
-from nclaw.utils import get_root
+from utils import get_root
 root = get_root(__file__)
 
 

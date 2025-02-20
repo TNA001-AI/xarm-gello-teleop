@@ -11,7 +11,7 @@ warnings.filterwarnings("always", category=RuntimeWarning)
 
 import sapien.core as sapien
 
-from nclaw.utils import get_root
+from utils import get_root
 root: Path = get_root(__file__)
 
 def np2o3d(pcd, color=None):

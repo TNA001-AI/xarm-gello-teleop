@@ -17,9 +17,7 @@ import kornia
 import sys
 sys.path.append(str(Path(__file__).parent.parent.parent))
 
-import nclaw
-from nclaw.utils import get_root
-from nclaw.ffmpeg import make_video
+from utils import get_root, mkdir
 root: Path = get_root(__file__)
 sys.path.append(str(root / "real_world"))
 sys.path.append(str(root / "../third-party/sam2"))
@@ -34,22 +32,22 @@ def match_timestamps(name: str, recording_dirs: dict, num_cams: int = 4):
             print(f"Processing {recording_name} {action_name}")
             
             save_dir = root / "log" / "data" / name
-            nclaw.utils.mkdir(save_dir, overwrite=False, resume=True)
+            mkdir(save_dir, overwrite=False, resume=True)
 
             episode_save_dir = save_dir / f"episode_{count:04d}"
-            nclaw.utils.mkdir(episode_save_dir, overwrite=True, resume=False)
+            mkdir(episode_save_dir, overwrite=True, resume=False)
 
             episode_save_dir_cam_list = []
             for cam in range(num_cams):
                 episode_save_dir_cam = episode_save_dir / f"camera_{cam}"
                 episode_save_dir_cam_rgb = episode_save_dir_cam / "rgb"
                 episode_save_dir_cam_depth = episode_save_dir_cam / "depth"
-                nclaw.utils.mkdir(episode_save_dir_cam_rgb, overwrite=True, resume=False)
-                nclaw.utils.mkdir(episode_save_dir_cam_depth, overwrite=True, resume=False)
+                mkdir(episode_save_dir_cam_rgb, overwrite=True, resume=False)
+                mkdir(episode_save_dir_cam_depth, overwrite=True, resume=False)
                 episode_save_dir_cam_list.append(episode_save_dir_cam)
 
             episode_save_dir_robot = episode_save_dir / "robot"
-            nclaw.utils.mkdir(episode_save_dir_robot, overwrite=True, resume=False)
+            mkdir(episode_save_dir_robot, overwrite=True, resume=False)
 
             count += 1
 
@@ -228,6 +226,14 @@ if __name__ == '__main__':
             dirs = {
                 'test/recording_1': ['1740075589', '1740075610', '1740075626', '1740075645', '1740075660', '1740075681'],
                 'test/recording_3': ['1740075844', '1740075853', '1740075863', '1740075873', '1740075883', '1740075898', '1740075910', '1740075923', '1740075972']
+            }
+        
+        if ii == 1:
+            args.name = 'test_run_processed'
+            args.bimanual = False
+            args.num_cams = 4
+            dirs = {
+                'test_run/recording_1': ['1740094945', '1740094960'],
             }
 
         # try:

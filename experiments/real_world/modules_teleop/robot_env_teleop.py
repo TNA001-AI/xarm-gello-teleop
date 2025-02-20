@@ -14,7 +14,7 @@ from pynput import keyboard
 from pathlib import Path
 from copy import deepcopy
 
-from nclaw.utils import get_root, mkdir
+from utils import get_root, mkdir
 root: Path = get_root(__file__)
 
 from modules_teleop.perception import Perception

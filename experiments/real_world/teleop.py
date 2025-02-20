@@ -3,7 +3,7 @@ import argparse
 import sys
 sys.path.append(str(Path(__file__).parent.parent.parent))
 
-from nclaw.utils import get_root, mkdir
+from utils import get_root, mkdir
 root: Path = get_root(__file__)
 sys.path.append(str(root / "real_world"))
 
@@ -17,7 +17,7 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--name', type=str, default='')
-    parser.add_argumenbt('--bimanual', action='store_true')
+    parser.add_argument('--bimanual', action='store_true')
     args = parser.parse_args()
 
     assert args.name != '', "Please provide a name for the experiment"

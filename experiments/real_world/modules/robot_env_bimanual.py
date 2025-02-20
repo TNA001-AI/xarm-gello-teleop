@@ -17,7 +17,7 @@ from .xarm_wrapper import XARM7
 from camera.multi_realsense import MultiRealsense, SingleRealsense
 from utils.pcd_utils import depth2fgpcd, rpy_to_rotation_matrix
 
-from nclaw.utils import get_root
+from utils import get_root
 root = get_root(__file__)
 
 
