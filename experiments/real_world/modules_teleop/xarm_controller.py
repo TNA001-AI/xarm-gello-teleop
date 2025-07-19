@@ -63,7 +63,6 @@ class XarmController(mp.Process):
 
 
     def log(self, msg):
-        self.pprint(msg)
         if self.verbose:
             self.pprint(msg)
     @staticmethod
