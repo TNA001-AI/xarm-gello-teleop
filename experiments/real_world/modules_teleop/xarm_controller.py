@@ -63,9 +63,9 @@ class XarmController(mp.Process):
 
 
     def log(self, msg):
+        self.pprint(msg)
         if self.verbose:
             self.pprint(msg)
-    
     @staticmethod
     def pprint(*args, **kwargs):
         try:
@@ -91,7 +91,7 @@ class XarmController(mp.Process):
         command_mode="cartesian",
         gripper_enable=False,
         speed=50,  # mm/s
-        verbose=False,
+        verbose=True,
     ):
         
         self.robot_id = robot_id
@@ -173,8 +173,9 @@ class XarmController(mp.Process):
                         state["gripper"] = cur_gripper_pos
                     self.state_sender.send(state)
 
-        except:
-            self.pprint(f"update_cur_position error")
+        except Exception as e:
+            self.pprint(f"update_cur_position error: {e}")
+            self.pprint(f"Traceback: {traceback.format_exc()}")
             self.state.value = ControllerState.STOP.value
         finally:
             # self.state_sender.close()
@@ -477,7 +478,7 @@ class XarmController(mp.Process):
                 if len(commands[0]) > 0:
                     if self.robot_id == 1:
                         print('\t' * 12, end='')
-                    print(f'activated: {self.teleop_activated}, commands: {[np.round(c, 4) for c in commands[0]]}')
+                    # print(f'activated: {self.teleop_activated}, commands: {[np.round(c, 4) for c in commands[0]]}')
                 # continue  # enable for debug
 
                 with self.exe_lock:
@@ -503,10 +504,10 @@ class XarmController(mp.Process):
                             assert len(command_state) == 8, "command state must be 8-dim"
 
                             current_joints = self.get_current_joint()
-                            current_gripper = self.get_current_gripper()
-                            current_gripper = (current_gripper - GRIPPER_OPEN_MAX) / (GRIPPER_OPEN_MIN - GRIPPER_OPEN_MAX)
-                            current_state = np.concatenate([current_joints, np.array([current_gripper])])
-
+                            # current_gripper = self.get_current_gripper()
+                            # current_gripper = (current_gripper - GRIPPER_OPEN_MAX) / (GRIPPER_OPEN_MIN - GRIPPER_OPEN_MAX)
+                            # current_state = np.concatenate([current_joints, np.array([current_gripper])])
+                            current_state = np.concatenate([current_joints, np.array([0])])
                             delta = command_state - current_state
                             joint_delta_norm = np.linalg.norm(delta[0:7])
                             max_joint_delta = np.abs(delta[0:7]).max()
@@ -526,9 +527,9 @@ class XarmController(mp.Process):
                             next_state[0:7] = next_state[0:7] - current_state[0:7]
                             
                             # denormalize gripper position
-                            gripper_pos = next_state[-1]
-                            denormalized_gripper_pos = gripper_pos * (GRIPPER_OPEN_MIN - GRIPPER_OPEN_MAX) + GRIPPER_OPEN_MAX
-                            next_state[-1] = denormalized_gripper_pos
+                            # gripper_pos = next_state[-1]
+                            # denormalized_gripper_pos = gripper_pos * (GRIPPER_OPEN_MIN - GRIPPER_OPEN_MAX) + GRIPPER_OPEN_MAX
+                            next_state[-1] = 0
                             # next_state = next_state.tolist()
                             # print('next state:', next_state.tolist())
 
@@ -540,8 +541,9 @@ class XarmController(mp.Process):
                 rate.sleep()
                 # time.sleep(max(0, self.COMMAND_CHECK_INTERVAL - (time.time() - start_time)))
             
-            except:
-                self.log(f"Error in xarm controller")
+            except Exception as e:
+                self.log(f"Error in xarm controller: {e}")
+                self.log(f"Traceback: {traceback.format_exc()}")
                 break
 
         self.stop()

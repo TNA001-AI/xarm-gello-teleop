@@ -32,7 +32,7 @@ if __name__ == '__main__':
         use_robot=True,
         use_gello=True,
         bimanual=args.bimanual,
-        gripper_enable=True,
+        gripper_enable=False,
         data_dir="data",
         debug=True,
     )

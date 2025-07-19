@@ -29,7 +29,7 @@ class GelloListener(mp.Process):
         self, 
         # shm_manager: SharedMemoryManager, 
         bimanual: bool = False,
-        gello_port: str = '/dev/ttyUSB0',
+        gello_port: str = '/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTAA0B5W-if00-port0',
         bimanual_gello_port: List[str] = ['/dev/ttyUSB0', '/dev/ttyUSB1'],
     ):
         super().__init__()
@@ -38,9 +38,11 @@ class GelloListener(mp.Process):
         self.bimanual_gello_port = bimanual_gello_port
 
         self.num_joints = 7
+        self.wrist = True
         self.gello_port = gello_port
-        self.calibrate_offset = False  # whether to recalibrate the offset
+        self.should_calibrate_offset = False  # whether to recalibrate the offset
         self.verbose = True
+        self.gripper = False
 
         if bimanual:
             examples = dict()
@@ -94,7 +96,7 @@ class GelloListener(mp.Process):
 
     def init_gello(self):
         if self.bimanual:
-            if self.calibrate_offset:
+            if self.should_calibrate_offset:
                 assert len(self.bimanual_gello_port) == 2, "Please provide two ports for bimanual calibration"
                 left_joint_offsets, left_gripper_config = self.calibrate_offset(port=self.bimanual_gello_port[0])
                 right_joint_offsets, right_gripper_config = self.calibrate_offset(port=self.bimanual_gello_port[1])
@@ -147,40 +149,52 @@ class GelloListener(mp.Process):
             self.agent = agent
 
         else:
-            if self.calibrate_offset:
-                joint_offsets, gripper_config = self.calibrate_offset(port=self.gello_port)
+            if self.should_calibrate_offset:
+                if self.gripper:
+                    joint_offsets, gripper_config = self.calibrate_offset(port=self.gello_port, gripper_enable=True)
+                else:
+                    joint_offsets = self.calibrate_offset(port=self.gello_port, gripper_enable=False)
+                    gripper_config = (8, 0, 0)
             
             else:
                 joint_offsets = (
-                    1 * np.pi / 2,
                     2 * np.pi / 2,
+                    2 * np.pi / 2,
+                    0 * np.pi / 2,
+                    1 * np.pi / 2,
                     4 * np.pi / 2,
                     1 * np.pi / 2,
-                    2 * np.pi / 2,
-                    2 * np.pi / 2,
                     2 * np.pi / 2
                 )
                 gripper_config = (8, 288, 246)
-
-            dynamixel_config = DynamixelRobotConfig(
-                joint_ids=(1, 2, 3, 4, 5, 6, 7),
-                joint_offsets=joint_offsets,
-                joint_signs=(1, 1, 1, 1, 1, 1, 1),
-                gripper_config=gripper_config,
-            )
-            gello_port = self.gello_port
-            start_joints = np.deg2rad([0, -45, 0, 30, 0, 75, 0, 0])
+            if not self.wrist:
+                dynamixel_config = DynamixelRobotConfig(
+                    joint_ids=(1, 2, 3, 4, 5, 6, 7,),
+                    joint_offsets=joint_offsets,
+                    joint_signs=(1, 1, 1, 1, 1, 1, 1),
+                    gripper_config=gripper_config,
+                )
+                gello_port = self.gello_port
+                start_joints = np.deg2rad([0, -45, 0, 30, 0, 75, 0, 0])
+            else:
+                dynamixel_config = DynamixelRobotConfig(
+                    joint_ids=(1, 2, 3, 4, 5, 6, 7, 8),
+                    joint_offsets=joint_offsets + (0,),
+                    joint_signs=(1, 1, 1, 1, 1, 1, 1, 1),
+                    gripper_config=None,
+                )
+                gello_port = self.gello_port
+                start_joints = np.deg2rad([0, -45, 0, 30, 0, 75, 0, 0])
             agent = GelloAgent(port=gello_port, dynamixel_config=dynamixel_config, start_joints=start_joints)
             self.agent = agent
 
         self.ready_event.set()
     
-    def calibrate_offset(self, port, verbose=False):
+    def calibrate_offset(self, port, gripper_enable=True, verbose=True):
         # MENAGERIE_ROOT = Path(__file__).parent / "third_party" / "mujoco_menagerie"
         
-        start_joints = tuple(np.deg2rad(0, -45, 0, 30, 0, 75, 0))  # The joint angles that the GELLO is placed in at (in radians)
-        joint_signs = (1, 1, -1, 1, 1, 1)  # The joint angles that the GELLO is placed in at (in radians)
-
+        start_joints = tuple(np.deg2rad([0, -45, 0, 30, 0, 75, 0]))  # The joint angles that the GELLO is placed in at (in radians)
+        joint_signs = (1, 1, 1, 1, 1, 1, 1)  # The joint angles that the GELLO is placed in at (in radians)
         joint_ids = list(range(1, self.num_joints + 1))
         driver = DynamixelDriver(joint_ids, port=port, baudrate=57600)
 
@@ -211,9 +225,9 @@ class GelloListener(mp.Process):
                         best_error = error
                         best_offset = offset
                 best_offsets.append(best_offset)
-
-        gripper_open = np.rad2deg(driver.get_joints()[-1]) - 0.2
-        gripper_close = np.rad2deg(driver.get_joints()[-1]) - 42
+        if gripper_enable:
+            gripper_open = np.rad2deg(driver.get_joints()[-1]) - 0.2
+            gripper_close = np.rad2deg(driver.get_joints()[-1]) - 42
         if self.verbose:
             print()
             print("best offsets               : ", [f"{x:.3f}" for x in best_offsets])
@@ -222,18 +236,22 @@ class GelloListener(mp.Process):
                 + ", ".join([f"{int(np.round(x/(np.pi/2)))}*np.pi/2" for x in best_offsets])
                 + " ]",
             )
-            print(
-                "gripper open (degrees)       ",
-                gripper_open,
-            )
-            print(
-                "gripper close (degrees)      ",
-                gripper_close,
-            )
+            if gripper_enable:
+                print(
+                    "gripper open (degrees)       ",
+                    gripper_open,
+                )
+                print(
+                    "gripper close (degrees)      ",
+                    gripper_close,
+                )
 
         joint_offsets = tuple(best_offsets)
-        gripper_config = (8, gripper_open, gripper_close)
-        return joint_offsets, gripper_config
+        if gripper_enable:
+            gripper_config = (8, gripper_open, gripper_close)   
+            return joint_offsets, gripper_config
+        else:
+            return joint_offsets
 
     def run(self):
         self.init_gello()
@@ -245,10 +263,12 @@ class GelloListener(mp.Process):
                 action = self.agent.get_action()
                 self.command[:] = action
                 # self.ring_buffer.put({'command': action, 'timestamp': time.time()})
-            except:
-                print(f"Error in GelloListener")
+            except Exception as e:
+                import traceback
+                print(f"Error in GelloListener: {e}")
+                print(f"Traceback: {traceback.format_exc()}")
                 break
-
+                
         self.stop()
         print("GelloListener exit!")
         
@@ -269,7 +289,6 @@ class GelloTeleop(mp.Process):
     ) -> None:
         super().__init__()
         self.gripper_enable = gripper_enable
-        assert self.gripper_enable, "Gripper must be enabled for Gello teleop"
 
         self.bimanual = bimanual
 
@@ -414,7 +433,7 @@ class GelloTeleop(mp.Process):
         self.gello_listener = GelloListener(
             # shm_manager=self.shm_manager,
             bimanual=self.bimanual,
-            gello_port='/dev/ttyUSB0',
+            gello_port='/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTAA0B5W-if00-port0',
             bimanual_gello_port=['/dev/ttyUSB0', '/dev/ttyUSB1'],
         )
         self.gello_listener.start()
@@ -442,10 +461,12 @@ class GelloTeleop(mp.Process):
                     self.command_sender_left.send([self.command[0][0:8]])
                     self.command_sender_right.send([self.command[0][8:16]])
                 else:
-                    self.command_sender.send(self.command)
+                    self.command_sender.send(self.command[0:8])
                 # time.sleep(max(0, COMMAND_CHECK_INTERVAL / 2 - (time.time() - command_start_time)))
-            except:
-                print(f"Error in GelloTeleop")
+            except Exception as e:
+                import traceback
+                print(f"Error in GelloTeleop: {e}")
+                print(f"Traceback: {traceback.format_exc()}")
                 break
         
         self.stop()

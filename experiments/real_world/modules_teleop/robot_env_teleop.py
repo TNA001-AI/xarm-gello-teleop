@@ -343,8 +343,10 @@ class RobotTeleopEnv(mp.Process):
                     self._update_robot()
                 if self.perception is not None:
                     self._update_perception()
-            except:
-                print(f"Error in update_real_state")
+            except Exception as e:
+                import traceback
+                print(f"Error in update_real_state: {e}")
+                print(f"Traceback: {traceback.format_exc()}")
                 break
         print("update_real_state stopped")
 
@@ -454,7 +456,7 @@ class RobotTeleopEnv(mp.Process):
                             eef_axis_colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]
 
                             if robot_out is not None:
-                                assert gripper_out is not None
+                                # assert gripper_out is not None
                                 eef_points_world_vis = []
                                 eef_points_vis = []
                                 if self.bimanual:
@@ -480,15 +482,16 @@ class RobotTeleopEnv(mp.Process):
                                     eef_world = np.concatenate([eef_points_world, eef_orientation_world], axis=0)  # (n+3, 3)
                                 
                                 # add gripper
-                                if self.bimanual:
-                                    left_gripper = gripper_out["left_value"]
-                                    right_gripper = gripper_out["right_value"]
-                                    gripper_world = np.array([left_gripper, right_gripper, 0.0])[None, :]  # (1, 3)
-                                else:
-                                    gripper = gripper_out["value"]
-                                    gripper_world = np.array([gripper, 0.0, 0.0])[None, :]  # (1, 3)
-
-                                eef_world = np.concatenate([eef_world, gripper_world], axis=0)  # (n+4, 3) or (2n+7, 3)
+                                if gripper_out is not None:
+                                    if self.bimanual:
+                                        left_gripper = gripper_out["left_value"]
+                                        right_gripper = gripper_out["right_value"]
+                                        gripper_world = np.array([left_gripper, right_gripper, 0.0])[None, :]  # (1, 3)
+                                    else:
+                                        gripper = gripper_out["value"]
+                                        gripper_world = np.array([gripper, 0.0, 0.0])[None, :]  # (1, 3)
+                                    eef_world = np.concatenate([eef_world, gripper_world], axis=0)  # (n+4, 3) or (2n+7, 3)
+                                # if no gripper, eef_world remains as (n+3, 3)
                                 np.savetxt(robot_record_dir / f"{robot_out['time']:.3f}.txt", eef_world, fmt="%.6f")
                                 
                                 eef_points_vis = np.concatenate(eef_points_vis, axis=0)
@@ -554,8 +557,10 @@ class RobotTeleopEnv(mp.Process):
 
                 time.sleep(max(0, 1 / fps - (time.time() - tic)))
             
-            except:
-                print(f"Error in robot teleop env")
+            except Exception as e:
+                import traceback
+                print(f"Error in robot teleop env: {e}")
+                print(f"Traceback: {traceback.format_exc()}")
                 break
         
         if self.use_robot:
