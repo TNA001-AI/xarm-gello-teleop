@@ -92,7 +92,7 @@ class FakeDynamixelDriver(DynamixelDriverProtocol):
 
 class DynamixelDriver(DynamixelDriverProtocol):
     def __init__(
-        self, ids: Sequence[int], port: str = "/dev/ttyUSB0", baudrate: int = 57600
+        self, ids: Sequence[int], port: str = "/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTAA0B5W-if00-port0", baudrate: int = 57600
     ):
         """Initialize the DynamixelDriver class.
 
@@ -254,7 +254,7 @@ def main():
     try:
         driver = DynamixelDriver(ids)
     except FileNotFoundError:
-        driver = DynamixelDriver(ids, port="/dev/cu.usbserial-FT7WBMUB")
+        driver = DynamixelDriver(ids, port="/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTAA0B5W-if00-port0")
 
     # Test setting torque mode
     driver.set_torque_mode(True)

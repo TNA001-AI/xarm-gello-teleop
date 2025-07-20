@@ -345,6 +345,7 @@ class XarmController(mp.Process):
         # velocity control (next_joints needs to be delta)
         v = next_joints / self.COMMAND_CHECK_INTERVAL * 0.15
         v = v.tolist()
+        # print("V:",v)
         code = self._arm.vc_set_joint_velocity(v, is_radian=True, is_sync=False, duration=0)
         
         # position control

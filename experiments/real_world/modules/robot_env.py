@@ -37,7 +37,7 @@ class RobotEnv:
             enable_depth=True,
             process_depth=False,
             use_robot=True,
-            verbose=False,
+            verbose=True,
             gripper_enable=False,
             speed=50,
             push_length=0.01,

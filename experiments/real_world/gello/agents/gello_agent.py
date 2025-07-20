@@ -30,7 +30,7 @@ class DynamixelRobotConfig:
         assert len(self.joint_ids) == len(self.joint_signs)
 
     def make_robot(
-        self, port: str = "/dev/ttyUSB0", start_joints: Optional[np.ndarray] = None
+        self, port: str = "/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTAA0B5W-if00-port0", start_joints: Optional[np.ndarray] = None
     ) -> DynamixelRobot:
         return DynamixelRobot(
             joint_ids=self.joint_ids,
