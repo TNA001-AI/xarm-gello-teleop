@@ -201,6 +201,7 @@ class RobotTeleopEnv(mp.Process):
                     robot_id=-1,
                     verbose=False,
                 )
+                #Tao
                 self.left_xarm_controller = None
                 self.right_xarm_controller = None
         else:
@@ -316,6 +317,12 @@ class RobotTeleopEnv(mp.Process):
                         "left_value": self.left_xarm_controller.cur_trans_q.get(),
                         "right_value": self.right_xarm_controller.cur_trans_q.get()
                     }
+                if not self.left_xarm_controller.cur_qpos_q.empty() and not self.right_xarm_controller.cur_qpos_q.empty():
+                    self.state["joint_out"] = {
+                        "time": time.time(),
+                        "left_value": self.left_xarm_controller.cur_qpos_q.get(),
+                        "right_value": self.right_xarm_controller.cur_qpos_q.get()
+                    }
                 if not self.left_xarm_controller.cur_gripper_q.empty() and not self.right_xarm_controller.cur_trans_q.empty():
                     self.state["gripper_out"] = {
                         "time": time.time(),
@@ -328,6 +335,11 @@ class RobotTeleopEnv(mp.Process):
                     self.state["robot_out"] = {
                         "time": time.time(),
                         "value": self.xarm_controller.cur_trans_q.get()
+                    }
+                if not self.xarm_controller.cur_qpos_q.empty():
+                    self.state["joint_out"] = {
+                        "time": time.time(),
+                        "value": self.xarm_controller.cur_qpos_q.get()
                     }
                 if not self.xarm_controller.cur_gripper_q.empty():
                     self.state["gripper_out"] = {
@@ -388,7 +400,9 @@ class RobotTeleopEnv(mp.Process):
         time.sleep(1)
 
         robot_record_dir = root / "log" / self.data_dir / self.exp_name / "robot"
+        joint_record_dir = root / "log" / self.data_dir / self.exp_name / "joint"
         os.makedirs(robot_record_dir, exist_ok=True)
+        os.makedirs(joint_record_dir, exist_ok=True)
 
         # initialize images
         rgbs = []
@@ -423,6 +437,7 @@ class RobotTeleopEnv(mp.Process):
                 # update images from realsense to shared memory
                 perception_out = state.get("perception_out", None)
                 robot_out = state.get("robot_out", None)
+                joint_out = state.get("joint_out", None)
                 gripper_out = state.get("gripper_out", None)
 
                 intrinsics = self.get_intrinsics()
@@ -493,6 +508,16 @@ class RobotTeleopEnv(mp.Process):
                                     eef_world = np.concatenate([eef_world, gripper_world], axis=0)  # (n+4, 3) or (2n+7, 3)
                                 # if no gripper, eef_world remains as (n+3, 3)
                                 np.savetxt(robot_record_dir / f"{robot_out['time']:.3f}.txt", eef_world, fmt="%.6f")
+                                
+                                # save joint position data
+                                if joint_out is not None:
+                                    if self.bimanual:
+                                        left_joints = joint_out["left_value"]
+                                        right_joints = joint_out["right_value"]
+                                        joint_data = np.concatenate([left_joints, right_joints], axis=0)  # (14,) - 7 joints per arm
+                                    else:
+                                        joint_data = joint_out["value"]  # (7,) - single arm joints
+                                    np.savetxt(joint_record_dir / f"{joint_out['time']:.3f}.txt", joint_data, fmt="%.6f")
                                 
                                 eef_points_vis = np.concatenate(eef_points_vis, axis=0)
                                 eef_points_world_vis = np.concatenate(eef_points_world_vis, axis=0)

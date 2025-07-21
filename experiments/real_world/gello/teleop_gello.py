@@ -44,7 +44,7 @@ class WristAnglePublisher(Node):
         self.running = True
         
         # Create timer for publishing at 50Hz
-        self.timer = self.create_timer(0.02, self.publish_callback)
+        self.timer = self.create_timer(1/60, self.publish_callback)
         
     def add_wrist_angle(self, angle):
         """Thread-safe method to add wrist angle to queue"""
