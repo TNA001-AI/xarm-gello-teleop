@@ -233,6 +233,10 @@ class RobotTeleopEnv(mp.Process):
         # robot eef
         self.eef_point = np.array([[0.0, 0.0, 0.175]])  # the eef point in the gripper frame
 
+        # ROS2 bag recording
+        self.ros2_bag_process = None
+        self.ros2_recording = False
+
     def real_start(self, start_time) -> None:
         self._real_alive.value = True
         print("starting real env")
@@ -281,10 +285,62 @@ class RobotTeleopEnv(mp.Process):
         if self.perception is not None and self.perception.alive.value:
             self.perception.stop()
         self.realsense.stop(wait=False)
+        
+        # Stop ROS2 bag recording if active
+        self.stop_ros2_bag_recording()
 
         self.image_display_thread.join()
         self.update_real_state_t.join()
         print("real env stopped")
+
+    def start_ros2_bag_recording(self) -> None:
+        """Start ROS2 bag recording for /orca_hand/joint_angles topic"""
+        if self.ros2_recording:
+            print("ROS2 bag recording already started")
+            return
+        
+        # Create bag directory
+        bag_dir = root / "log" / self.data_dir / self.exp_name / "ros2_bag"
+        os.makedirs(bag_dir, exist_ok=True)
+        
+        # Start ROS2 bag record
+        cmd = [
+            "ros2", "bag", "record", 
+            "/orca_hand/joint_angles",
+            "-o", str(bag_dir / f"hand_joint_angles_{time.time():.0f}")
+        ]
+        
+        try:
+            self.ros2_bag_process = subprocess.Popen(
+                cmd, 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.PIPE,
+                preexec_fn=os.setsid  # Create new process group for clean termination
+            )
+            self.ros2_recording = True
+            print(f"Started ROS2 bag recording: {' '.join(cmd)}")
+        except Exception as e:
+            print(f"Failed to start ROS2 bag recording: {e}")
+
+    def stop_ros2_bag_recording(self) -> None:
+        """Stop ROS2 bag recording"""
+        if not self.ros2_recording or self.ros2_bag_process is None:
+            return
+        
+        try:
+            # Send SIGINT to process group for graceful termination
+            os.killpg(os.getpgid(self.ros2_bag_process.pid), 2)  # SIGINT
+            self.ros2_bag_process.wait(timeout=5)
+            print("Stopped ROS2 bag recording")
+        except subprocess.TimeoutExpired:
+            # Force kill if graceful termination fails
+            os.killpg(os.getpgid(self.ros2_bag_process.pid), 9)  # SIGKILL
+            print("Force stopped ROS2 bag recording")
+        except Exception as e:
+            print(f"Error stopping ROS2 bag recording: {e}")
+        finally:
+            self.ros2_bag_process = None
+            self.ros2_recording = False
 
     @property
     def real_alive(self) -> bool:
@@ -426,10 +482,12 @@ class RobotTeleopEnv(mp.Process):
 
                 if teleop.record_start.value == True:
                     self.perception.set_record_start()
+                    self.start_ros2_bag_recording()  # Start ROS2 bag recording
                     teleop.record_start.value = False
 
                 if teleop.record_stop.value == True:
                     self.perception.set_record_stop()
+                    self.stop_ros2_bag_recording()   # Stop ROS2 bag recording
                     teleop.record_stop.value = False
 
                 idx += 1

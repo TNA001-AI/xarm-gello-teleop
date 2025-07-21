@@ -168,8 +168,8 @@ if __name__ == '__main__':
 
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_id', type=int, default=-1)
-    parser.add_argument('--num_cams', type=int, default=4)
+    parser.add_argument('--data_id', type=int, default=1)
+    parser.add_argument('--num_cams', type=int, default=2)
     parser.add_argument('--name', type=str, default='')
     parser.add_argument('--bimanual', action='store_true')
     args = parser.parse_args()
@@ -231,9 +231,9 @@ if __name__ == '__main__':
         if ii == 1:
             args.name = 'test_run_processed'
             args.bimanual = False
-            args.num_cams = 4
+            args.num_cams = 2
             dirs = {
-                'test_run/recording_1': ['1740094945', '1740094960'],
+                'tao/recording_1': ['1753122120'],
             }
 
         # try:
