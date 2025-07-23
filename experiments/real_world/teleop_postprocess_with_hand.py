@@ -129,15 +129,20 @@ def match_timestamps_with_bags(name: str, recording_dirs: dict, num_cams: int = 
             # Load joint data (already saved as files)
             joint_dir = recording_dir / "joint"
             joint_timestamps = []
+            joint_data_lookup = {}
+            # Create joint directory (always create, even if no joint data exists)
+            episode_joint_dir = episode_save_dir / "joint"
+            
             if joint_dir.exists():
                 joint_files = sorted([f for f in os.listdir(joint_dir) if f.endswith('.txt')])
                 joint_timestamps = [float(f[:-4]) for f in joint_files]
-                # Copy joint files to episode directory
-                episode_joint_dir = episode_save_dir / "joint"
+                # Create lookup table for joint data
+                for i, joint_file in enumerate(joint_files):
+                    timestamp = float(joint_file[:-4])
+                    joint_data_lookup[timestamp] = joint_dir / joint_file
+                # Create joint directory (files will be copied with integer names later)
                 mkdir(episode_joint_dir, overwrite=True, resume=False)
-                # Use rsync instead of cp to avoid argument list too long error
-                subprocess.run(f'rsync -a {joint_dir}/ {episode_joint_dir}/', shell=True)
-                print(f"Processed {len(joint_files)} joint files")
+                print(f"Loaded {len(joint_files)} joint files for processing")
             
             # Load camera data (existing functionality)
             action_dir = recording_dir / str(action_name)
@@ -324,6 +329,14 @@ def match_timestamps_with_bags(name: str, recording_dirs: dict, num_cams: int = 
                     robot_data = robot_data1 * (1 - weight) + robot_data2 * weight
 
                 np.savetxt(episode_save_dir_robot / f"{t:06d}.txt", robot_data)
+                
+                # Copy joint data with integer filename
+                if joint_idx >= 0 and joint_timestamps:
+                    joint_timestamp = joint_timestamps[joint_idx]
+                    source_joint_file = joint_data_lookup[joint_timestamp]
+                    target_joint_file = episode_joint_dir / f"{t:06d}.txt"
+                    subprocess.run(f'cp {source_joint_file} {target_joint_file}', shell=True)
+                
                 successful_matches += 1
                 
             print(f"Successfully processed {successful_matches}/{len(action_timestamps)} frames")
@@ -396,3 +409,4 @@ if __name__ == '__main__':
                 f.write(f"{ii}: {e}\n{error_details}\n")
             print(f"Error in {args.name}: {e}")
             print(f"Full traceback: {error_details}")
+#   camera0_timestamp camera1_timestamp joint:index hand:index
