@@ -323,20 +323,20 @@ def get_safe_version(repo_id: str, version: str | packaging.version.Version) -> 
     target_version = (
         packaging.version.parse(version) if not isinstance(version, packaging.version.Version) else version
     )
-    hub_versions = get_repo_versions(repo_id)
+    
+    # Check if this is a local dataset (no remote repo access needed)
+    try:
+        hub_versions = get_repo_versions(repo_id)
+    except Exception:
+        # If we can't access remote repo, assume it's a local dataset
+        # Return the current codebase version
+        from .lerobot_dataset import CODEBASE_VERSION
+        return CODEBASE_VERSION
 
     if not hub_versions:
-        raise RevisionNotFoundError(
-            f"""Your dataset must be tagged with a codebase version.
-            Assuming _version_ is the codebase_version value in the info.json, you can run this:
-            ```python
-            from huggingface_hub import HfApi
-
-            hub_api = HfApi()
-            hub_api.create_tag("{repo_id}", tag="_version_", repo_type="dataset")
-            ```
-            """
-        )
+        # If no remote versions found, assume local dataset
+        from .lerobot_dataset import CODEBASE_VERSION
+        return CODEBASE_VERSION
 
     if target_version in hub_versions:
         return f"v{target_version}"

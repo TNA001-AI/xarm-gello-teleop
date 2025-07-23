@@ -218,3 +218,4 @@ slurm/
 pyrightconfig.json
 log/
 /temp_mitsuba_video
+local_datasets/
