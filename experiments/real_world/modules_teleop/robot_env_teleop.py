@@ -24,6 +24,16 @@ from gello.teleop_gello import GelloTeleop
 from camera.multi_realsense import MultiRealsense
 from camera.single_realsense import SingleRealsense
 
+# Import ROS2 bag conversion functionality
+import sys
+sys.path.append(str(root / "experiments" / "real_world"))
+try:
+    from ros2bag_to_text import convert_bag_to_text
+    ROS2_BAG_CONVERTER_AVAILABLE = True
+except ImportError:
+    ROS2_BAG_CONVERTER_AVAILABLE = False
+    print("Warning: ROS2 bag converter not available")
+
 
 class EnvEnum(Enum):
     NONE = 0
@@ -236,6 +246,11 @@ class RobotTeleopEnv(mp.Process):
         # ROS2 bag recording
         self.ros2_bag_process = None
         self.ros2_recording = False
+        self.current_bag_path = None
+        self.act_hand_topic  =  "/orca_hand/act_joint_states"
+        self.act_gello_topic =  "/gello/act_joint_states"
+        self.obs_hand_topic  =  "/orca_hand/obs_joint_states"
+
 
     def real_start(self, start_time) -> None:
         self._real_alive.value = True
@@ -303,11 +318,16 @@ class RobotTeleopEnv(mp.Process):
         bag_dir = root / "log" / self.data_dir / self.exp_name / "ros2_bag"
         os.makedirs(bag_dir, exist_ok=True)
         
+        # Store bag path for later conversion
+        self.current_bag_path = bag_dir / f"hand_joint_angles_{time.time():.0f}"
+        
         # Start ROS2 bag record
         cmd = [
             "ros2", "bag", "record", 
-            "/orca_hand/joint_angles",
-            "-o", str(bag_dir / f"hand_joint_angles_{time.time():.0f}")
+            self.act_hand_topic, 
+            self.obs_hand_topic, 
+            self.act_gello_topic,
+            "-o", str(self.current_bag_path)
         ]
         
         try:
@@ -327,20 +347,131 @@ class RobotTeleopEnv(mp.Process):
         if not self.ros2_recording or self.ros2_bag_process is None:
             return
         
+        graceful_shutdown = False
         try:
             # Send SIGINT to process group for graceful termination
             os.killpg(os.getpgid(self.ros2_bag_process.pid), 2)  # SIGINT
-            self.ros2_bag_process.wait(timeout=5)
-            print("Stopped ROS2 bag recording")
+            self.ros2_bag_process.wait(timeout=15)  # Increased timeout to 15 seconds
+            print("Stopped ROS2 bag recording gracefully")
+            graceful_shutdown = True
         except subprocess.TimeoutExpired:
-            # Force kill if graceful termination fails
-            os.killpg(os.getpgid(self.ros2_bag_process.pid), 9)  # SIGKILL
-            print("Force stopped ROS2 bag recording")
+            print("ROS2 bag recording did not stop gracefully, trying SIGTERM...")
+            try:
+                # Try SIGTERM before SIGKILL
+                os.killpg(os.getpgid(self.ros2_bag_process.pid), 15)  # SIGTERM
+                self.ros2_bag_process.wait(timeout=10)
+                print("Stopped ROS2 bag recording with SIGTERM")
+                graceful_shutdown = True
+            except subprocess.TimeoutExpired:
+                # Last resort: force kill
+                os.killpg(os.getpgid(self.ros2_bag_process.pid), 9)  # SIGKILL
+                print("Force stopped ROS2 bag recording")
+                graceful_shutdown = False
         except Exception as e:
             print(f"Error stopping ROS2 bag recording: {e}")
         finally:
             self.ros2_bag_process = None
             self.ros2_recording = False
+            
+            # Wait a bit for file system to finalize the database
+            if graceful_shutdown:
+                print("Waiting for database to finalize...")
+                time.sleep(3)
+            
+            # Convert ROS2 bag to text files after recording stops
+            self.convert_ros2_bag_to_text(graceful_shutdown)
+
+    def convert_ros2_bag_to_text(self, graceful_shutdown: bool = False) -> None:
+        """Convert the recorded ROS2 bag to text files in the hand directory"""
+        if not ROS2_BAG_CONVERTER_AVAILABLE:
+            print("Warning: ROS2 bag converter not available, skipping conversion")
+            return
+            
+        if not hasattr(self, 'current_bag_path') or self.current_bag_path is None:
+            print("Warning: No bag path available for conversion")
+            return
+            
+        if not graceful_shutdown:
+            print("Warning: ROS2 bag was force-stopped, file may be corrupted. Skipping conversion.")
+            print("To avoid this issue, ensure the recording stops cleanly without interruption.")
+            return
+            
+        try:
+            # Check if bag path exists and has valid files
+            if not self.current_bag_path.exists():
+                print(f"Warning: Bag path does not exist: {self.current_bag_path}")
+                return
+                
+            # Check for SQLite database files
+            db_files = list(self.current_bag_path.glob("*.db3"))
+            if not db_files:
+                print(f"Warning: No database files found in bag: {self.current_bag_path}")
+                return
+                
+            # Create directories for action, observation, and gello data
+            act_hand_output_dir = root / "log" / self.data_dir / self.exp_name / "action" / "hand"
+            obs_hand_output_dir = root / "log" / self.data_dir / self.exp_name /   "obs"  / "hand"
+            act_gello_output_dir= root / "log" / self.data_dir / self.exp_name / "action" / "gello"
+            
+            print(f"Converting ROS2 bag to text files...")
+            print(f"Bag path: {self.current_bag_path}")
+            print(f"Action hand output directory: {act_hand_output_dir}")
+            print(f"Observation hand output directory: {obs_hand_output_dir}")
+            print(f"Action gello output directory: {act_gello_output_dir}")
+            print(f"Found {len(db_files)} database file(s)")
+            
+            # Convert action hand data
+            print(f"Converting action hand topic: {self.act_hand_topic}")
+            success_act_hand = convert_bag_to_text(
+                bag_path=str(self.current_bag_path),
+                topic_name=self.act_hand_topic,
+                output_dir=str(act_hand_output_dir)
+            )
+            
+            # Convert observation hand data
+            print(f"Converting observation hand topic: {self.obs_hand_topic}")
+            success_obs = convert_bag_to_text(
+                bag_path=str(self.current_bag_path),
+                topic_name=self.obs_hand_topic,
+                output_dir=str(obs_hand_output_dir)
+            )
+            
+            # Convert action gello data
+            print(f"Converting action gello topic: {self.act_gello_topic}")
+            success_act_gello = convert_bag_to_text(
+                bag_path=str(self.current_bag_path),
+                topic_name=self.act_gello_topic,
+                output_dir=str(act_gello_output_dir)
+            )
+            
+            # Report conversion results
+            results = []
+            if success_act_hand:
+                results.append("action hand data")
+            if success_obs:
+                results.append("observation hand data")
+            if success_act_gello:
+                results.append("action gello data")
+            
+            if len(results) == 3:
+                print("Successfully converted all data: action hand, observation hand, and action gello")
+            elif len(results) > 0:
+                print(f"Successfully converted: {', '.join(results)}")
+                if not success_act_hand:
+                    print("Failed to convert action hand data")
+                if not success_obs:
+                    print("Failed to convert observation hand data") 
+                if not success_act_gello:
+                    print("Failed to convert action gello data")
+            else:
+                print("Failed to convert all data: action hand, observation hand, and action gello")
+                
+        except Exception as e:
+            print(f"Error converting ROS2 bag to text: {e}")
+            print("This usually happens when the bag file is corrupted due to improper shutdown.")
+        finally:
+            # Clear the bag path after conversion attempt
+            self.current_bag_path = None
 
     @property
     def real_alive(self) -> bool:
@@ -455,8 +586,8 @@ class RobotTeleopEnv(mp.Process):
             teleop.start()
         time.sleep(1)
 
-        robot_record_dir = root / "log" / self.data_dir / self.exp_name / "robot"
-        joint_record_dir = root / "log" / self.data_dir / self.exp_name / "joint"
+        robot_record_dir = root / "log" / self.data_dir / self.exp_name / "obs" / "ee_robot"
+        joint_record_dir = root / "log" / self.data_dir / self.exp_name / "obs" / "xarm7"
         os.makedirs(robot_record_dir, exist_ok=True)
         os.makedirs(joint_record_dir, exist_ok=True)
 

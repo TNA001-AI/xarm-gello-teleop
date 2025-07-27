@@ -27,9 +27,7 @@ try:
     from sensor_msgs.msg import JointState
     ROS2_AVAILABLE = True
 except ImportError:
-    print("Warning: ROS2 dependencies not available. Please install:")
-    print("  pip install rclpy rosbag2-py rosidl-runtime-py")
-    print("  sudo apt install ros-<distro>-std-msgs ros-<distro>-sensor-msgs")
+    print("Warning: ROS2 dependencies not available.")
     ROS2_AVAILABLE = False
 
 

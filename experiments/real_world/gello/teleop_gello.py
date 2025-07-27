@@ -10,7 +10,8 @@ from typing import Tuple, List
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
-from std_msgs.msg import Float32
+from std_msgs.msg import Float64MultiArray
+from sensor_msgs.msg import JointState
 import queue
 
 from modules_teleop.udp_util import udpReceiver, udpSender
@@ -28,9 +29,9 @@ from gello.dynamixel.driver import DynamixelDriver
 np.set_printoptions(precision=2, suppress=True)
 
 
-class WristAnglePublisher(Node):
+class GelloJointPublisher(Node):
     def __init__(self):
-        super().__init__('wrist_angle_publisher')
+        super().__init__('hand_joint_publisher')
         
         # Create QoS profile with Best Effort reliability
         qos_profile = QoSProfile(
@@ -39,38 +40,62 @@ class WristAnglePublisher(Node):
             depth=10
         )
         
-        self.publisher = self.create_publisher(Float32, '/gello/wrist_angle', qos_profile)
-        self.wrist_queue = queue.Queue(maxsize=100)
+        # Publishers for action joint states with timestamps
+        self.act_publisher = self.create_publisher(JointState, '/gello/act_joint_states', qos_profile)
+        
+        # Queues for thread-safe communication
+        self.act_joint_queue = queue.Queue(maxsize=10)
         self.running = True
         
-        # Create timer for publishing at 50Hz
+        # Create timer for publishing at 60Hz
         self.timer = self.create_timer(1/60, self.publish_callback)
         
-    def add_wrist_angle(self, angle):
-        """Thread-safe method to add wrist angle to queue"""
+    def add_joint_data(self, joints):
+        """Thread-safe method to add joint data to appropriate queue"""
         try:
+            # Ensure we have 8 joints
+            joint_data = list(joints)[:8]  # Take first 8 joints
+            assert len(joint_data) ==  8, "Less than 8 joints"
+            
+            target_queue = self.act_joint_queue
+            
             # Non-blocking put, discard old data if queue is full
-            self.wrist_queue.put_nowait(float(angle))
+            target_queue.put_nowait(joint_data)
         except queue.Full:
             # Remove oldest item and add new one
             try:
-                self.wrist_queue.get_nowait()
-                self.wrist_queue.put_nowait(float(angle))
+                target_queue.get_nowait()
+                target_queue.put_nowait(joint_data)
             except queue.Empty:
                 pass
+        except Exception as e:
+            self.get_logger().error(f'Error adding joint data: {e}')
     
     def publish_callback(self):
-        """Timer callback to publish wrist angles"""
+        """Timer callback to publish joint states with timestamps"""
         try:
-            # Get the latest angle from queue
-            latest_angle = None
-            while not self.wrist_queue.empty():
-                latest_angle = self.wrist_queue.get_nowait()
+            # Publish action joint states
+            latest_act_joints = None
+            while not self.act_joint_queue.empty():
+                latest_act_joints = self.act_joint_queue.get_nowait()
             
-            if latest_angle is not None:
-                msg = Float32()
-                msg.data = latest_angle
-                self.publisher.publish(msg)
+            if latest_act_joints is not None:
+                msg = JointState()
+                msg.header.stamp = self.get_clock().now().to_msg()
+                msg.header.frame_id = "gello_hand"
+                
+                # Joint names for 8 joints
+                msg.name = [f"joint_{i+1}" for i in range(8)]
+                
+                # Joint positions (8 joints)
+                msg.position = [float(x) for x in latest_act_joints]
+                
+                # Optional: velocities and efforts (can be empty)
+                msg.velocity = []
+                msg.effort = []
+                
+                self.act_publisher.publish(msg)
+            
         except queue.Empty:
             pass
         except Exception as e:
@@ -351,7 +376,7 @@ class GelloTeleop(mp.Process):
         
         # Initialize ROS2 in separate thread
         self.ros_thread = None
-        self.wrist_publisher = None
+        self.joint_publisher = None
         self.ros_initialized = False
 
         self.key_states = {
@@ -391,17 +416,17 @@ class GelloTeleop(mp.Process):
         def ros_worker():
             try:
                 rclpy.init()
-                self.wrist_publisher = WristAnglePublisher()
+                self.joint_publisher = GelloJointPublisher()
                 self.ros_initialized = True
-                self.log("ROS2 wrist publisher started")
+                self.log("ROS2 joint publisher started")
                 
                 # Spin the node
-                rclpy.spin(self.wrist_publisher)
+                rclpy.spin(self.joint_publisher)
             except Exception as e:
                 self.log(f"ROS2 thread error: {e}")
             finally:
-                if self.wrist_publisher:
-                    self.wrist_publisher.destroy_node()
+                if self.joint_publisher:
+                    self.joint_publisher.destroy_node()
                 rclpy.shutdown()
                 
         self.ros_thread = threading.Thread(target=ros_worker, daemon=True)
@@ -413,8 +438,8 @@ class GelloTeleop(mp.Process):
     
     def stop_ros_thread(self):
         """Stop ROS2 thread"""
-        if self.wrist_publisher:
-            self.wrist_publisher.stop()
+        if self.joint_publisher:
+            self.joint_publisher.stop()
         if self.ros_thread and self.ros_thread.is_alive():
             self.ros_thread.join(timeout=1.0)
 
@@ -559,10 +584,10 @@ class GelloTeleop(mp.Process):
                     self.command_sender_right.send([self.command[0][8:16]])
                 else:
                     self.command_sender.send(self.command)
-                    # Publish wrist angle if available (8th element, index 7)
-                    if len(self.command[0]) > 7 and self.wrist_publisher:
-                        wrist_angle = self.command[0][7]
-                        self.wrist_publisher.add_wrist_angle(wrist_angle)
+                    # Publish all 8 joints if available
+                    if len(self.command[0]) >= 8 and self.joint_publisher:
+                        all_joints = self.command[0][:8]  # Take first 8 joints
+                        self.joint_publisher.add_joint_data(all_joints)
                 # time.sleep(max(0, COMMAND_CHECK_INTERVAL / 2 - (time.time() - command_start_time)))
             except Exception as e:
                 import traceback
