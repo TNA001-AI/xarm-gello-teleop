@@ -282,9 +282,9 @@ def convert_recording_to_lerobot(
         all_start_times.append(min(obs_hand_timestamps))
         all_end_times.append(max(obs_hand_timestamps))
     
-    # The stable period is from the latest start to the earliest end
+    # The stable period is from the latest start to the earliest end, minus last 1 second
     stable_start = max(all_start_times)
-    stable_end = min(all_end_times)
+    stable_end = min(all_end_times) - 2.0  # Exclude last 1 second
     
     logger.info(f"Data overlap period: {stable_start:.3f} to {stable_end:.3f} ({stable_end - stable_start:.3f}s)")
     
@@ -297,11 +297,11 @@ def convert_recording_to_lerobot(
     logger.info(f"Processing {len(stable_cam_frames)} stable camera frames (out of {len(cams_timestamps)} total)...")
     successful_matches = 0
     
-    for t, cam_timestamp in stable_cam_frames:
+    for stable_idx, (original_t, cam_timestamp) in enumerate(stable_cam_frames):
         master_timestamp = cam_timestamp[0]
         
-        if t % 50 == 0:  # Progress indicator every 50 frames
-            logger.info(f"Processing frame {t}/{len(cams_timestamps)}, timestamp: {master_timestamp}")
+        if stable_idx % 50 == 0:  # Progress indicator every 50 frames
+            logger.info(f"Processing stable frame {stable_idx}/{len(stable_cam_frames)}, timestamp: {master_timestamp}")
         
         # Find corresponding joint data
         obs_xarm7_idx = -1
@@ -344,17 +344,17 @@ def convert_recording_to_lerobot(
                     obs_hand_idx = ht
         # Skip frame if no joint data
         if obs_xarm7_idx < 0:
-            logger.warning(f"No obs xarm7 data found for frame {t}")
+            logger.warning(f"No obs xarm7 data found for frame {stable_idx}")
             continue
         # Skip frame if missing required hand/gello data (strict alignment required)
         if act_hand_idx < 0:
-            logger.warning(f"No act hand data found for frame {t}")
+            logger.warning(f"No act hand data found for frame {stable_idx}")
             continue
         if act_gello_idx < 0:
-            logger.warning(f"No act gello data found for frame {t}")
+            logger.warning(f"No act gello data found for frame {stable_idx}")
             continue  
         if obs_hand_idx < 0:
-            logger.warning(f"No joint data found for frame {t}")
+            logger.warning(f"No obs hand data found for frame {stable_idx}")
             continue
         
         # Prepare frame data
@@ -383,12 +383,12 @@ def convert_recording_to_lerobot(
             camera_dir = obs_dir / f"camera_{cam_idx}"
             
             # RGB image
-            rgb_file = camera_dir / "rgb" / f"{t:06d}.jpg"
+            rgb_file = camera_dir / "rgb" / f"{original_t:06d}.jpg"
             if rgb_file.exists():
                 rgb_image = Image.open(rgb_file)
                 frame_data[f'observation.images.cam_{cam_idx}'] = np.array(rgb_image)
             else:
-                logger.warning(f"Missing RGB image for camera {cam_idx}, frame {t}")
+                logger.warning(f"Missing RGB image for camera {cam_idx}, frame {original_t}")
                 
             # Skip depth images for now (LeRobot image writer requires 3-channel images)
         
@@ -397,7 +397,7 @@ def convert_recording_to_lerobot(
             dataset.add_frame(frame_data, task=task_name, timestamp=master_timestamp)
             successful_matches += 1
         except Exception as e:
-            logger.error(f"Error adding frame {t}: {e}")
+            logger.error(f"Error adding frame {stable_idx}: {e}")
             continue
     
     # Check if we have sufficient valid frames
@@ -561,7 +561,7 @@ def main():
         fps=args.fps,
         robot_type=args.robot_type,
         task_name=args.task_name,
-        tolerance_s=0.05
+        tolerance_s=0.04
     )
     
     if success:
