@@ -35,119 +35,45 @@ logger = logging.getLogger(__name__)
 root: Path = get_root(__file__)
 
 
-def infer_features_from_raw_data(recording_dirs: Dict[str, List[str]], num_cams: int) -> Dict:
-    """Infer dataset features from raw recording data across all episodes."""
-    features = {}
+def get_features(recording_dirs: Dict[str, List[str]], num_cams: int) -> Dict:
+    """Hardcoded features for xarm-gello-teleop dataset."""
     
-    # Check all recordings to see what features are consistently available
-    has_action_hand = True
-    has_action_gello = True
-    has_obs_hand = True
+    # Combined observation.state (xarm 7 joints + hand obs 17 joints = 24 total)
+    state_names = [f"xarm_joint_{i}" for i in range(7)]
+    state_names.extend([f"obs_hand_joint_{i}" for i in range(17)])
     
-    for recording_name, action_name_list in recording_dirs.items():
-        recording_dir = Path("/home/yolandazhu/xarm-gello-teleop/experiments/log/data") / recording_name
-        
-        # Check for xarm7 data (required)
-        obs_gello_dir = recording_dir / "obs" / "xarm7"
-        if obs_gello_dir.exists():
-            joint_files = sorted([f for f in os.listdir(obs_gello_dir) if f.endswith('.txt')])
-            if joint_files:
-                joint_data = np.loadtxt(obs_gello_dir / joint_files[0])
-                joint_dim = joint_data.shape[0] if joint_data.ndim == 1 else joint_data.shape[0]
-                features["observation.xarm_joint_pos"] = {"dtype": "float32", "shape": (joint_dim,), "names": [f"xarm_joint_{i}" for i in range(joint_dim)]}
-        
-        # Check if action hand data exists in ALL recordings
-        act_hand_dir = recording_dir / "action" / "hand"
-        if not (act_hand_dir.exists() and list(act_hand_dir.glob("*.txt"))):
-            has_action_hand = False
-            
-        # Check if action gello data exists in ALL recordings  
-        act_gello_dir = recording_dir / "action" / "gello"
-        if not (act_gello_dir.exists() and list(act_gello_dir.glob("*.txt"))):
-            has_action_gello = False
-            
-        # Check if observation hand data exists in ALL recordings
-        obs_hand_dir = recording_dir / "obs" / "hand"
-        if not (obs_hand_dir.exists() and list(obs_hand_dir.glob("*.txt"))):
-            has_obs_hand = False
+    # Combined action (hand 16 joints + gello 8 joints = 24 total)  
+    action_names = [f"act_hand_joint_{i}" for i in range(16)]
+    action_names.extend([f"gello_joint_{i}" for i in range(8)])
     
-    # Only add features that exist in ALL recordings
-    if has_action_hand:
-        # Get sample to determine dimensions
-        for recording_name, action_name_list in recording_dirs.items():
-            recording_dir = Path("/home/yolandazhu/xarm-gello-teleop/experiments/log/data") / recording_name
-            act_hand_dir = recording_dir / "action" / "hand"
-            hand_files = sorted([f for f in act_hand_dir.glob("*.txt") if f.name != "metadata.txt"])
-            if hand_files:
-                sample_hand_data = np.loadtxt(hand_files[0])
-                hand_dim = sample_hand_data.shape[0] if sample_hand_data.ndim == 1 else sample_hand_data.shape[0]
-                features['action.hand_joint_pos'] = {"dtype": "float32", "shape": (hand_dim,), "names": [f"act_hand_joint_{i}" for i in range(hand_dim)]}
-                logger.info(f"Added action hand joint features with dimension: {hand_dim}")
-                break
-    else:
-        logger.info("Action hand data not available in all recordings, skipping")
-        
-    if has_action_gello:
-        # Get sample to determine dimensions
-        for recording_name, action_name_list in recording_dirs.items():
-            recording_dir = Path("/home/yolandazhu/xarm-gello-teleop/experiments/log/data") / recording_name
-            act_gello_dir = recording_dir / "action" / "gello"
-            gello_files = sorted([f for f in act_gello_dir.glob("*.txt") if f.name != "metadata.txt"])
-            if gello_files:
-                sample_gello_data = np.loadtxt(gello_files[0])
-                gello_dim = sample_gello_data.shape[0] if sample_gello_data.ndim == 1 else sample_gello_data.shape[0]
-                features['action.gello_joint_pos'] = {"dtype": "float32", "shape": (gello_dim,), "names": [f"gello_joint_{i}" for i in range(gello_dim)]}
-                logger.info(f"Added action gello joint features with dimension: {gello_dim}")
-                break
-    else:
-        logger.info("Action gello data not available in all recordings, skipping")
-        
-    if has_obs_hand:
-        # Get sample to determine dimensions
-        for recording_name, action_name_list in recording_dirs.items():
-            recording_dir = Path("/home/yolandazhu/xarm-gello-teleop/experiments/log/data") / recording_name
-            obs_hand_dir = recording_dir / "obs" / "hand"
-            hand_files = sorted([f for f in obs_hand_dir.glob("*.txt") if f.name != "metadata.txt"])
-            if hand_files:
-                sample_hand_data = np.loadtxt(hand_files[0])
-                hand_dim = sample_hand_data.shape[0] if sample_hand_data.ndim == 1 else sample_hand_data.shape[0]
-                features['observation.hand_joint_pos'] = {"dtype": "float32", "shape": (hand_dim,), "names": [f"obs_hand_joint_{i}" for i in range(hand_dim)]}
-                logger.info(f"Added observation hand joint features with dimension: {hand_dim}")
-                break
-    else:
-        logger.info("Observation hand data not available in all recordings, skipping")
+    features = {
+        "observation.state": {
+            "dtype": "float32", 
+            "shape": (24,), 
+            "names": state_names
+        },
+        "action": {
+            "dtype": "float32", 
+            "shape": (24,), 
+            "names": action_names
+        },
+        "observation.images.cam_0": {
+            "dtype": "image", 
+            "shape": (480, 848, 3), 
+            "names": ["height", "width", "channels"]
+        },
+        "observation.images.cam_1": {
+            "dtype": "image", 
+            "shape": (480, 848, 3), 
+            "names": ["height", "width", "channels"]
+        }
+    }
     
-    # Add camera features - check first recording for image dimensions
-    for recording_name, action_name_list in recording_dirs.items():
-        if action_name_list:
-            recording_dir = Path("/home/yolandazhu/xarm-gello-teleop/experiments/log/data") / recording_name
-            obs_base_dir = recording_dir / "obs"
-            if obs_base_dir.exists():
-                obs_dirs = [d for d in obs_base_dir.iterdir() if d.is_dir() and d.name.isdigit()]
-                if obs_dirs:
-                    obs_dir = obs_dirs[0]  # Use first obs directory
-                    for cam_idx in range(num_cams):
-                        camera_dir = obs_dir / f"camera_{cam_idx}"
-                        
-                        # Check RGB image dimensions
-                        rgb_dir = camera_dir / "rgb"
-                        if rgb_dir.exists():
-                            rgb_files = sorted([f for f in os.listdir(rgb_dir) if f.endswith('.jpg')])
-                            if rgb_files:
-                                rgb_image = Image.open(rgb_dir / rgb_files[0])
-                                height, width = rgb_image.size[1], rgb_image.size[0]  # PIL uses (width, height)
-                                features[f'observation.images.cam_{cam_idx}'] = {
-                                    "dtype": "image", 
-                                    "shape": (height, width, 3), 
-                                    "names": ["height", "width", "channels"]
-                                }
-                    
-                    # Skip depth images for now due to channel issues with LeRobot image writer
-                    # TODO: Add depth support when LeRobot supports single-channel images
-                    logger.info(f"Skipping depth images (LeRobot requires 3-channel images)")
-                    break  # Only need to check first recording for image dimensions
+    logger.info("Using hardcoded features for xarm-gello-teleop dataset")
+    logger.info(f"observation.state: {features['observation.state']['shape']}")
+    logger.info(f"action: {features['action']['shape']}")
+    logger.info(f"Images: cam_0 and cam_1 with shape {features['observation.images.cam_0']['shape']}")
     
-    logger.info(f"Inferred features: {features}")
     return features
 
 def convert_recording_to_lerobot(
@@ -284,7 +210,7 @@ def convert_recording_to_lerobot(
     
     # The stable period is from the latest start to the earliest end, minus last 1 second
     stable_start = max(all_start_times)
-    stable_end = min(all_end_times) - 2.0  # Exclude last 1 second
+    stable_end = min(all_end_times) - 2.2  # Exclude last 1 second
     
     logger.info(f"Data overlap period: {stable_start:.3f} to {stable_end:.3f} ({stable_end - stable_start:.3f}s)")
     
@@ -296,6 +222,9 @@ def convert_recording_to_lerobot(
     
     logger.info(f"Processing {len(stable_cam_frames)} stable camera frames (out of {len(cams_timestamps)} total)...")
     successful_matches = 0
+    
+    # Get start time for relative timestamps
+    episode_start_time = stable_cam_frames[0][1][0] if stable_cam_frames else 0
     
     for stable_idx, (original_t, cam_timestamp) in enumerate(stable_cam_frames):
         master_timestamp = cam_timestamp[0]
@@ -342,21 +271,19 @@ def convert_recording_to_lerobot(
                 if t_diff < min_dist:
                     min_dist = t_diff
                     obs_hand_idx = ht
-        # Skip frame if no joint data
-        if obs_xarm7_idx < 0:
-            logger.warning(f"No obs xarm7 data found for frame {stable_idx}")
-            continue
-        # Skip frame if missing required hand/gello data (strict alignment required)
+        # Check if all required data is present - return False if missing to skip episode
         if act_hand_idx < 0:
-            logger.warning(f"No act hand data found for frame {stable_idx}")
-            continue
+            logger.warning(f"No act hand data found for frame {stable_idx}, skipping episode")
+            return False
         if act_gello_idx < 0:
-            logger.warning(f"No act gello data found for frame {stable_idx}")
-            continue  
+            logger.warning(f"No act gello data found for frame {stable_idx}, skipping episode")
+            return False
         if obs_hand_idx < 0:
-            logger.warning(f"No obs hand data found for frame {stable_idx}")
-            continue
-        
+            logger.warning(f"No obs hand data found for frame {stable_idx}, skipping episode")
+            return False
+        if obs_xarm7_idx < 0:
+            logger.warning(f"No obs xarm7 data found for frame {stable_idx}, skipping episode")
+            return False       
         # Prepare frame data
         frame_data = {}
         
@@ -364,19 +291,32 @@ def convert_recording_to_lerobot(
         xarm7_timestamp = obs_xarm7_timestamps[obs_xarm7_idx]
         source_joint_file = joint_data_lookup[xarm7_timestamp]
         joint_data = np.loadtxt(source_joint_file).astype(np.float32)
-        frame_data['observation.xarm_joint_pos'] = joint_data
         
-        # Load action hand joint data (required) - ensure correct dtype
-        _, act_hand_data = act_hand_data_list[act_hand_idx]
-        frame_data['action.hand_joint_pos'] = act_hand_data.astype(np.float32)
-    
-        # Load action gello joint data (required) - ensure correct dtype
-        _, act_gello_data = act_gello_data_list[act_gello_idx]
-        frame_data['action.gello_joint_pos'] = act_gello_data.astype(np.float32)
+        # Combine observation data into observation.state
+        state_parts = [joint_data]
         
-        # Load observation hand joint data (required) - ensure correct dtype
-        _, obs_hand_data = obs_hand_data_list[obs_hand_idx]
-        frame_data['observation.hand_joint_pos'] = obs_hand_data.astype(np.float32)
+        # Add observation hand data if available
+        if obs_hand_idx >= 0:
+            _, obs_hand_data = obs_hand_data_list[obs_hand_idx]
+            state_parts.append(obs_hand_data.astype(np.float32))
+        
+        frame_data['observation.state'] = np.concatenate(state_parts)
+        
+        # Combine action data into action
+        action_parts = []
+        
+        # Add action hand data if available
+        if act_hand_idx >= 0:
+            _, act_hand_data = act_hand_data_list[act_hand_idx]
+            action_parts.append(act_hand_data.astype(np.float32))
+        
+        # Add action gello data if available  
+        if act_gello_idx >= 0:
+            _, act_gello_data = act_gello_data_list[act_gello_idx]
+            action_parts.append(act_gello_data.astype(np.float32))
+        
+        if action_parts:
+            frame_data['action'] = np.concatenate(action_parts)
         
         # Load camera images from obs directory
         for cam_idx in range(num_cams):
@@ -393,12 +333,12 @@ def convert_recording_to_lerobot(
             # Skip depth images for now (LeRobot image writer requires 3-channel images)
         
         # Add frame to dataset
-        try:
-            dataset.add_frame(frame_data, task=task_name, timestamp=master_timestamp)
-            successful_matches += 1
-        except Exception as e:
-            logger.error(f"Error adding frame {stable_idx}: {e}")
-            continue
+        
+        # Use relative timestamp (subtract episode start time)
+        relative_timestamp = master_timestamp - episode_start_time
+        dataset.add_frame(frame_data, task=task_name, timestamp=relative_timestamp)
+        successful_matches += 1
+
     
     # Check if we have sufficient valid frames
     if successful_matches == 0:
@@ -423,7 +363,7 @@ def direct_convert_to_lerobot(
     logger.info(f"Starting direct conversion to LeRobot dataset: {output_repo_id}")
     
     # Infer features from all recordings to ensure consistency
-    features = infer_features_from_raw_data(recording_dirs, num_cams)
+    features = get_features(recording_dirs, num_cams)
     
     # Create LeRobot dataset
 
@@ -464,7 +404,11 @@ def direct_convert_to_lerobot(
                 else:
                     logger.warning(f"Failed to convert {recording_name}/{action_name}")
             except Exception as e:
+                import traceback
                 logger.error(f"Error converting {recording_name}/{action_name}: {e}")
+                logger.error(f"Traceback: {traceback.format_exc()}")
+                # Stop conversion on critical errors
+                return False
     
     logger.info(f"Successfully converted {successful_episodes}/{total_episodes} episodes")
     
