@@ -28,14 +28,15 @@ from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
 
+BATCH_SIZE = 128
 
 def main():
     # Create a directory to store the training checkpoint.
-    output_directory = Path("outputs/train/xarm_gello_diffusion")
+    output_directory = Path("/data/xarm_gello_diffusion")
     output_directory.mkdir(parents=True, exist_ok=True)
 
     # Select your device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda")
     print(f"Using device: {device}")
 
     # Number of offline training steps
@@ -46,7 +47,7 @@ def main():
     # Load our converted xarm-gello-teleop dataset
     # Update this path to match your converted dataset location
     dataset_repo_id = "tao_dataset"
-    dataset_root = Path("/home/yolandazhu/xarm-gello-teleop/local_datasets").resolve()
+    dataset_root = Path("/data/local_datasets").resolve()
     
     # When starting from scratch, we need to specify input/output shapes and dataset stats
     dataset_metadata = LeRobotDatasetMetadata(dataset_repo_id, root=dataset_root)
@@ -59,7 +60,8 @@ def main():
 
     # Policies are initialized with a configuration class, in this case `DiffusionConfig`. For this example,
     # we'll just use the defaults and so no arguments other than input/output features need to be passed.
-    cfg = DiffusionConfig(input_features=input_features, output_features=output_features, device=device)
+    # Pass device as string to avoid serialization issues
+    cfg = DiffusionConfig(input_features=input_features, output_features=output_features, device="cuda")
 
     # We can now instantiate our policy with this config and the dataset stats.
     policy = DiffusionPolicy(cfg, dataset_stats=dataset_metadata.stats)
@@ -92,14 +94,13 @@ def main():
     
     # Create optimizer and dataloader for offline training
     # Adjust batch size based on GPU memory and dataset size
-    batch_size = min(32, len(dataset) // 10)  # Adaptive batch size
-    print(f"Using batch size: {batch_size}")
+    print(f"Using batch size: {BATCH_SIZE}")
     
     optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=2,  # Reduced for stability
-        batch_size=batch_size,
+        batch_size=BATCH_SIZE,
         shuffle=True,
         pin_memory=device.type != "cpu",
         drop_last=True,

@@ -25,7 +25,7 @@ if __name__ == '__main__':
     env = RobotTeleopEnv(
         mode='3D',
         exp_name=args.name,
-        resolution=(848, 480),
+        resolution=(424, 240),
         capture_fps=30,
         record_fps=30,
         perception_process_func=None,

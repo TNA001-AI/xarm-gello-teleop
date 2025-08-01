@@ -339,8 +339,6 @@ def convert_recording_to_lerobot(
         
         # Use relative timestamp (subtract episode start time)
         relative_timestamp = master_timestamp - episode_start_time
-        if relative_timestamp < 0:
-            return False
         dataset.add_frame(frame_data, task=task_name, timestamp=relative_timestamp)
         successful_matches += 1
     
@@ -355,8 +353,7 @@ def convert_recording_to_lerobot(
 def direct_convert_to_lerobot(
     recording_dirs: Dict[str, List[str]],
     output_repo_id: str,
-    data_root: Path,
-    output_root: Path = None,
+    output_root: Optional[Path] = None,
     num_cams: int = 2,
     fps: int = 30,
     robot_type: str = "xarm",
@@ -371,9 +368,6 @@ def direct_convert_to_lerobot(
     features = get_features(recording_dirs, num_cams)
     
     # Create LeRobot dataset
-    
-    # Ensure output directory exists
-    output_root.mkdir(parents=True, exist_ok=True)
 
     # Create dataset metadata first
     dataset = LeRobotDataset.create(
@@ -395,7 +389,7 @@ def direct_convert_to_lerobot(
     total_episodes = sum(len(action_list) for action_list in recording_dirs.values())
     
     for recording_name, action_name_list in recording_dirs.items():
-        recording_dir = data_root / recording_name
+        recording_dir = Path("/data") / recording_name
         
         if not recording_dir.exists():
             logger.warning(f"Recording directory not found: {recording_dir}")
@@ -431,6 +425,7 @@ def direct_convert_to_lerobot(
                 logger.error(f"Traceback: {traceback.format_exc()}")
                 # Reset episode buffer when there's an error
                 dataset.clear_episode_buffer()
+                # Continue with next episode instead of stopping entirely
                 continue
     
     # logger.info(f"Successfully converted {successful_episodes}/{total_episodes} episodes")
@@ -445,22 +440,22 @@ def direct_convert_to_lerobot(
 
 def discover_episodes(data_root: Path) -> Dict[str, List[str]]:
     """Automatically discover all episodes under tao directory."""
-    dir = data_root
+    tao_dir = data_root / "bottle"
     episodes = {}
     
-    if not dir.exists():
-        logger.warning(f"Directory not found: {dir}")
+    if not tao_dir.exists():
+        logger.warning(f"Directory not found: {tao_dir}")
         return episodes
     
     # Scan all recording directories (r0, r1, r2, etc.)
-    for recording_dir in sorted(dir.iterdir()):
+    for recording_dir in sorted(tao_dir.iterdir()):
         if recording_dir.is_dir() and recording_dir.name.startswith('r'):
             obs_dir = recording_dir / "obs"
             if obs_dir.exists():
                 # Find all timestamp directories
                 timestamp_dirs = [d.name for d in obs_dir.iterdir() if d.is_dir() and d.name.isdigit()]
                 if timestamp_dirs:
-                    recording_name = recording_dir.name
+                    recording_name = f"bottle/{recording_dir.name}"
                     episodes[recording_name] = sorted(timestamp_dirs)
                     logger.info(f"Found {len(timestamp_dirs)} episodes in {recording_name}: {timestamp_dirs}")
     
@@ -469,7 +464,7 @@ def discover_episodes(data_root: Path) -> Dict[str, List[str]]:
 def main():
     parser = argparse.ArgumentParser(description="Direct conversion from raw recordings to LeRobot format")
     parser.add_argument('--data_id', type=int, default=0,
-                       help='Data configuration ID (0, 1)')
+                       help='Data configuration ID (0, 1, 2, or 99)')
     parser.add_argument('--output_repo_id', type=str, default="xarm_manipulation_direct",
                        help='Repository ID for the output LeRobot dataset')
     parser.add_argument('--output_root', type=str, default="/data/local_datasets",
@@ -490,16 +485,26 @@ def main():
     # Configuration mapping (same as teleop_postprocess_with_hand.py)
     ii = args.data_id
     
-    data_root: Path
+
     if ii == 0:
         bimanual = False
         num_cams = 2
         # Automatically discover all episodes under tao directory
-        data_root = Path("/data/bottle")
+        data_root = Path("/data/")
         dirs = discover_episodes(data_root)
         if not dirs:
             logger.error("No episodes found under tao directory")
             exit(1)
+    elif ii == 1:
+        args.name = 'test_run_processed'
+        args.bimanual = False
+        args.num_cams = 2
+        bimanual = False
+        num_cams = 2
+        dirs = {
+            'tao/r14': ['1753807049'],
+        }
+
     else:
         logger.error(f"No configuration found for data_id {ii}")
         logger.error("Available data_ids: 0")
@@ -523,13 +528,12 @@ def main():
     success = direct_convert_to_lerobot(
         recording_dirs=dirs,
         output_repo_id=repo_id,
-        data_root=data_root,
         output_root=output_root,
         num_cams=num_cams,
         fps=args.fps,
         robot_type=args.robot_type,
         task_name=args.task_name,
-        tolerance_s=0.04
+        tolerance_s=0.05
     )
     
     if success:
