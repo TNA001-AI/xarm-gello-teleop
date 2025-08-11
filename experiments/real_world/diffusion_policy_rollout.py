@@ -35,6 +35,7 @@ import traceback
 import numpy as np
 import torch
 import cv2
+import pygame
 from collections import deque
 
 # Add project root to path
@@ -44,6 +45,7 @@ sys.path.append(str(Path(__file__).parent))
 from modules_teleop.xarm_controller import XarmController
 from camera.multi_realsense import MultiRealsense
 from utils import get_root, mkdir
+from multiprocess.managers import SharedMemoryManager
 
 # ROS2 imports for hand control
 try:
@@ -182,6 +184,7 @@ class DiffusionPolicyRollout:
         self.xarm_controller = None
         self.hand_controller = None
         self.camera_system = None
+        self.shm_manager = None
         
         # Data buffers
         self.observation_buffer = deque(maxlen=history_length)
@@ -191,6 +194,12 @@ class DiffusionPolicyRollout:
         # Control flags
         self.running = False
         self.policy_thread = None
+        
+        # Visualization components
+        self.visualization_thread = None
+        self.display_queue = deque(maxlen=10)
+        self.coordinate_history = deque(maxlen=100)
+        self.predicted_coordinates = None
         
     def load_policy(self):
         """Load the trained diffusion policy using LeRobot factory"""
@@ -242,13 +251,18 @@ class DiffusionPolicyRollout:
         """Initialize camera system"""
         print("Setting up cameras...")
         
-        # Use two cameras by default if serial numbers not specified
-        if self.camera_serial_numbers is None:
-            self.camera_serial_numbers = ['cam_left', 'cam_right']  # Will auto-detect actual serials
+        # Initialize shared memory manager (critical for camera data)
+        self.shm_manager = SharedMemoryManager()
+        self.shm_manager.start()
         
-        # Initialize camera system
+        # Use auto-detection if serial numbers not specified
+        if self.camera_serial_numbers is None:
+            self.camera_serial_numbers = None  # Will auto-detect all available cameras
+        
+        # Initialize camera system with shared memory manager
         self.camera_system = MultiRealsense(
-            serial_numbers=self.camera_serial_numbers[:2],  # Use only first 2 cameras
+            shm_manager=self.shm_manager,  # Critical for proper operation
+            serial_numbers=self.camera_serial_numbers,  # Use specified cameras or auto-detect
             resolution=(1280, 720),  # Capture at higher res, will resize for policy
             capture_fps=30,
             enable_depth=False,  # Diffusion policy typically uses RGB only
@@ -256,14 +270,19 @@ class DiffusionPolicyRollout:
             verbose=self.verbose
         )
         
+        # Set camera parameters (matching teleoperation settings)
+        print("Setting camera exposure and white balance...")
+        self.camera_system.set_exposure(exposure=100, gain=60)  # 100: bright, 60: dark
+        self.camera_system.set_white_balance(3800)
+        
     def preprocess_images(self, images: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
         """Preprocess camera images for policy input"""
         processed = {}
         
-        camera_names = ['cam_left', 'cam_right']
+        # Use actual camera keys and map to cam_0, cam_1 for consistency
         camera_keys = list(images.keys())[:2]  # Use first 2 cameras
         
-        for cam_key, cam_name in zip(camera_keys, camera_names):
+        for idx, cam_key in enumerate(camera_keys):
             if cam_key in images:
                 img = images[cam_key]['color']  # RGB image
                 
@@ -276,7 +295,7 @@ class DiffusionPolicyRollout:
                 # Normalize to [0, 1] and convert to tensor (C, H, W)
                 img = torch.from_numpy(img.transpose(2, 0, 1)).float() / 255.0
                 
-                processed[f'observation.images.{cam_name}'] = img
+                processed[f'observation.images.cam_{idx}'] = img
         
         return processed
     
@@ -319,7 +338,7 @@ class DiffusionPolicyRollout:
         obs_list = list(self.observation_buffer)
         
         # Process images - stack along sequence dimension, then add batch dimension
-        for cam_name in ['observation.images.cam_left', 'observation.images.cam_right']:
+        for cam_name in ['observation.images.cam_0', 'observation.images.cam_1']:
             if cam_name in obs_list[0]:
                 # Stack sequence: (history_length, C, H, W)
                 images = torch.stack([obs[cam_name] for obs in obs_list])
@@ -349,6 +368,9 @@ class DiffusionPolicyRollout:
                 hand_actions = actions[:16]  # First 16 DOF for hand
                 gello_actions = actions[16:24]  # Next 8 DOF for gello -> xarm mapping
             
+            # Store predicted coordinates for visualization
+            self.predicted_coordinates = gello_actions[:7]  # Joint space predictions
+            
             # Send hand commands (16 DOF)
             if self.hand_controller is not None:
                 self.hand_controller.send_hand_command(hand_actions)
@@ -361,6 +383,126 @@ class DiffusionPolicyRollout:
             
         except Exception as e:
             print(f"Error executing actions: {e}")
+    
+    def visualization_thread_func(self):
+        """Background thread for real-time visualization"""
+        try:
+            # Initialize pygame with proper display backend
+            import os
+            os.environ['SDL_VIDEODRIVER'] = 'x11'  # Force X11 for Linux
+            pygame.init()
+            pygame.font.init()
+            
+            # Window dimensions - make bigger to accommodate larger images
+            window_width = 1400
+            window_height = 800
+            
+            screen = pygame.display.set_mode((window_width, window_height))
+            pygame.display.set_caption('Diffusion Policy Rollout - Real-time Visualization')
+        except Exception as e:
+            print(f"Failed to initialize pygame display: {e}")
+            print("Running without visualization...")
+            return
+        
+        # Colors
+        WHITE = (255, 255, 255)
+        BLACK = (0, 0, 0)
+        RED = (255, 0, 0)
+        GREEN = (0, 255, 0)
+        BLUE = (0, 0, 255)
+        GRAY = (128, 128, 128)
+        
+        clock = pygame.time.Clock()
+        font = pygame.font.Font(None, 36)
+        small_font = pygame.font.Font(None, 24)
+        
+        print("Visualization thread started...")
+        
+        frame_count = 0
+        while self.running:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    self.running = False
+                    return
+            
+            screen.fill(WHITE)
+            
+            # Display camera images
+            if len(self.display_queue) > 0:
+                display_data = self.display_queue[-1]  # Get latest
+                images = display_data.get('images', {})
+                
+                # Display cameras side by side - centered
+                cam_width, cam_height = 600, 360
+                total_cam_width = cam_width * 2 + 20  # Two cameras with 20px gap
+                start_x = (window_width - total_cam_width) // 2  # Center horizontally
+                
+                for idx, (cam_key, img_data) in enumerate(list(images.items())[:2]):
+                    if 'color' in img_data:
+                        img = img_data['color']
+                        # Resize and convert for pygame
+                        img_resized = cv2.resize(img, (cam_width, cam_height))
+                        img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
+                        img_surface = pygame.surfarray.make_surface(img_rgb.swapaxes(0, 1))
+                        
+                        # Draw camera image - centered
+                        x_pos = start_x + idx * (cam_width + 20)
+                        screen.blit(img_surface, (x_pos, 20))
+                        
+                        # Label camera - centered under image
+                        label = small_font.render(f"Camera {idx}", True, BLACK)
+                        label_x = x_pos + (cam_width - label.get_width()) // 2
+                        screen.blit(label, (label_x, 20 + cam_height + 10))
+            
+            # Display coordinate information - adjust for bigger images
+            coord_panel_x = 20
+            coord_panel_y = 400
+            
+            # Current robot state
+            if len(self.coordinate_history) > 0:
+                current_joints = self.coordinate_history[-1]
+                
+                # Draw coordinate panel
+                pygame.draw.rect(screen, GRAY, (coord_panel_x, coord_panel_y, 350, 250), 2)
+                
+                title = font.render("Robot State", True, BLACK)
+                screen.blit(title, (coord_panel_x + 10, coord_panel_y + 10))
+                
+                # Current joint positions
+                y_offset = 50
+                for i, joint_val in enumerate(current_joints[:7]):
+                    joint_text = small_font.render(f"Joint {i}: {joint_val:.3f} rad", True, BLACK)
+                    screen.blit(joint_text, (coord_panel_x + 10, coord_panel_y + y_offset + i * 25))
+            
+            # Predicted coordinates
+            if self.predicted_coordinates is not None:
+                pred_panel_x = 400
+                pred_panel_y = 400
+                
+                # Draw prediction panel
+                pygame.draw.rect(screen, BLUE, (pred_panel_x, pred_panel_y, 350, 250), 2)
+                
+                title = font.render("Policy Predictions", True, BLUE)
+                screen.blit(title, (pred_panel_x + 10, pred_panel_y + 10))
+                
+                # Predicted joint deltas
+                y_offset = 50
+                for i, pred_val in enumerate(self.predicted_coordinates[:7]):
+                    pred_text = small_font.render(f"Delta {i}: {pred_val:.3f}", True, BLUE)
+                    screen.blit(pred_text, (pred_panel_x + 10, pred_panel_y + y_offset + i * 25))
+            
+            # Status information
+            status_text = f"Step: {self.step_count} | Obs Buffer: {len(self.observation_buffer)} | Action Buffer: {len(self.action_buffer)}"
+            status_surface = small_font.render(status_text, True, BLACK)
+            screen.blit(status_surface, (20, window_height - 30))
+            
+            pygame.display.flip()
+            
+            frame_count += 1
+            clock.tick(30)  # 30 FPS
+        
+        pygame.quit()
+        print("Visualization thread stopped")
     
     def policy_inference_thread(self):
         """Background thread for policy inference following LeRobot pattern"""
@@ -403,6 +545,9 @@ class DiffusionPolicyRollout:
     
     def run_rollout(self, duration: float = 60.0):
         """Run the diffusion policy rollout"""
+        # Create data directories
+        data_dir = self.root / "log" / "data" / self.exp_name
+        mkdir(data_dir, overwrite=True, resume=False)
         print(f"Starting diffusion policy rollout for {duration} seconds...")
         
         # Setup all systems
@@ -416,6 +561,8 @@ class DiffusionPolicyRollout:
         
         print("Starting camera system...")
         self.camera_system.start()
+        # Critical: restart_put after starting (matches teleoperation pattern)
+        self.camera_system.restart_put(time.time() + 1)
         time.sleep(2)  # Let cameras warm up
         
         # Start policy inference thread
@@ -423,9 +570,15 @@ class DiffusionPolicyRollout:
         self.policy_thread = threading.Thread(target=self.policy_inference_thread)
         self.policy_thread.start()
         
-        # Create data directories
-        data_dir = self.root / "log" / "data" / self.exp_name
-        mkdir(data_dir, overwrite=False, resume=False)
+        # Start visualization thread (if enabled)
+        if not getattr(self, 'no_visualization', False):
+            print("Starting visualization thread...")
+            self.visualization_thread = threading.Thread(target=self.visualization_thread_func)
+            self.visualization_thread.start()
+        else:
+            print("Visualization disabled")
+        
+
         
         print("Starting main rollout loop...")
         start_time = time.time()
@@ -436,17 +589,34 @@ class DiffusionPolicyRollout:
                 
                 # Get camera observations
                 images = {}
-                if hasattr(self.camera_system, 'get_images'):
-                    images = self.camera_system.get_images()
-                elif hasattr(self.camera_system, 'cameras'):
-                    for serial, camera in self.camera_system.cameras.items():
-                        if hasattr(camera, 'get_image'):
-                            images[serial] = camera.get_image()
+                cameras_output = self.camera_system.get(k=1)
+                if cameras_output:
+                    camera_serials = list(self.camera_system.cameras.keys())
+                    for idx, serial in enumerate(camera_serials):
+                        if idx in cameras_output and 'color' in cameras_output[idx]:
+                            color_data = cameras_output[idx]['color']
+                            if color_data.ndim == 4:
+                                color_data = color_data[-1]
+                            images[serial] = {'color': color_data}
                 
                 # Get robot state
                 robot_state = self.get_robot_state()
                 
+                # Always add to display queue if we have images (for visualization)
+                if images:
+                    display_data = {
+                        'images': images,
+                        'robot_state': robot_state,
+                        'timestamp': time.time()
+                    }
+                    self.display_queue.append(display_data)
+                
+                # Only add to observation buffer if we have both images and robot state
                 if images and robot_state is not None:
+                    # Store current robot joints for visualization
+                    current_joints = robot_state['observation.xarm_joint_pos']
+                    self.coordinate_history.append(current_joints)
+                    
                     # Preprocess observations
                     processed_images = self.preprocess_images(images)
                     
@@ -490,10 +660,12 @@ class DiffusionPolicyRollout:
         """Cleanup all systems"""
         print("Cleaning up...")
         
-        # Stop inference thread
+        # Stop threads
         self.running = False
         if self.policy_thread is not None:
             self.policy_thread.join(timeout=5)
+        if self.visualization_thread is not None:
+            self.visualization_thread.join(timeout=5)
         
         # Stop robot systems
         if self.xarm_controller is not None:
@@ -501,6 +673,10 @@ class DiffusionPolicyRollout:
         
         if self.camera_system is not None:
             self.camera_system.stop()
+        
+        # Stop shared memory manager
+        if self.shm_manager is not None:
+            self.shm_manager.shutdown()
         
         # Shutdown ROS2
         if ROS2_AVAILABLE and self.hand_controller is not None:
@@ -512,7 +688,7 @@ class DiffusionPolicyRollout:
 
 def main():
     parser = argparse.ArgumentParser(description="Diffusion Policy Rollout for Hand-Arm Robot")
-    parser.add_argument("--policy_path", type=str, required=True,
+    parser.add_argument("--policy_path", type=str, default="/data/xarm_orca_diffusion/checkpoints/last",
                        help="Path to trained diffusion policy (.safetensors file)")
     parser.add_argument("--exp_name", type=str, default="diffusion_rollout",
                        help="Experiment name for logging")
@@ -530,6 +706,8 @@ def main():
                        help="Device for policy inference (cuda/cpu)")
     parser.add_argument("--verbose", action="store_true",
                        help="Enable verbose logging")
+    parser.add_argument("--no_visualization", action="store_true",
+                       help="Disable real-time visualization window")
     
     args = parser.parse_args()
     
@@ -544,6 +722,9 @@ def main():
         device=args.device,
         verbose=args.verbose
     )
+    
+    # Set visualization flag
+    rollout.no_visualization = args.no_visualization
     
     # Run rollout
     try:

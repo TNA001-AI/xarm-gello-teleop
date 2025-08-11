@@ -5,7 +5,6 @@ from enum import Enum
 import traceback
 
 import numpy as np
-import transforms3d
 import copy
 
 from xarm.wrapper import XArmAPI
@@ -17,6 +16,33 @@ from modules_teleop.common.xarm import *
 
 np.set_printoptions(precision=2, suppress=True)
 
+def rotation_matrix_to_euler_xyz(R):
+    """
+    Convert a 3x3 rotation matrix to XYZ Euler angles.
+    
+    Parameters:
+    R : numpy array (3x3)
+        Rotation matrix
+    
+    Returns:
+    numpy array (3,)
+        Euler angles [rx, ry, rz] in radians
+    """
+    # Check for gimbal lock
+    sy = np.sqrt(R[0, 0]**2 + R[1, 0]**2)
+    
+    singular = sy < 1e-6
+    
+    if not singular:
+        x = np.arctan2(R[2, 1], R[2, 2])
+        y = np.arctan2(-R[2, 0], sy)
+        z = np.arctan2(R[1, 0], R[0, 0])
+    else:
+        x = np.arctan2(-R[1, 2], R[1, 1])
+        y = np.arctan2(-R[2, 0], sy)
+        z = 0
+    
+    return np.array([x, y, z])
 
 class Rate:
     def __init__(self, *, duration):
@@ -146,7 +172,7 @@ class XarmController(mp.Process):
                 fk_trans_mat = self.kin_helper.compute_fk_sapien_links(cur_qpos, [self.kin_helper.sapien_eef_idx])[0]
                 cur_xyzrpy = np.zeros(6)
                 cur_xyzrpy[:3] = fk_trans_mat[:3, 3] * 1000
-                cur_xyzrpy[3:] = transforms3d.euler.mat2euler(fk_trans_mat[:3, :3])
+                cur_xyzrpy[3:] = rotation_matrix_to_euler_xyz(fk_trans_mat[:3, :3])
                 cur_xyzrpy[3:] = cur_xyzrpy[3:] / np.pi * 180
                 
                 # self.log(f"d_pos: {self.arm.get_position()[1][0:6]-cur_position}")

@@ -50,8 +50,8 @@ from lerobot.utils.wandb_utils import WandBLogger
 ## --------------------------------------- ##
 TOLERANCE_S = 0.05
 STEPS = 100000
-BATCH_SIZE = 256
-NUM_WORKERS = 12
+BATCH_SIZE = 128
+NUM_WORKERS = 10
 ## --------------------------------------- ##
 def update_policy(
     train_metrics: MetricsTracker,
@@ -138,7 +138,7 @@ def custom_train(cfg: TrainPipelineConfig):
         delta_timestamps=delta_timestamps,
         image_transforms=image_transforms,
         revision=cfg.dataset.revision,
-        video_backend=cfg.dataset.video_backend,
+        video_backend="torchcodec",
         tolerance_s= TOLERANCE_S,  
     )
     
@@ -193,12 +193,14 @@ def custom_train(cfg: TrainPipelineConfig):
 
     dataloader = torch.utils.data.DataLoader(
         dataset,
-        num_workers=cfg.num_workers,
-        batch_size=cfg.batch_size,
-        shuffle=shuffle,
-        sampler=sampler,
-        pin_memory=False,
-        drop_last=False,
+        num_workers        = cfg.num_workers,
+        batch_size         = cfg.batch_size,
+        shuffle            = True if sampler is None else False,
+        sampler            = sampler,
+        pin_memory         = True,
+        persistent_workers = True,
+        prefetch_factor    = 6,         
+        drop_last          = False,
     )
     dl_iter = cycle(dataloader)
 
