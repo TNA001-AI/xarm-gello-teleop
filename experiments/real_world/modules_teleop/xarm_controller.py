@@ -298,7 +298,7 @@ class XarmController(mp.Process):
         self._arm.motion_enable(True)
         if self.command_mode == "cartesian":
             mode = 1
-        elif self.command_mode == "joints":
+        elif self.command_mode == "joints" or self.command_mode == "rollout":
             mode = 4
         else:
             raise ValueError("Invalid command mode")
@@ -496,7 +496,7 @@ class XarmController(mp.Process):
                 start_time = time.time()
                 commands = self.command_receiver.get("xarm_control", pop=True)
                 if commands is None or len(commands) == 0:
-                    if self.command_mode == 'joints':  # velocity control
+                    if self.command_mode == 'joints' or self.command_mode == "rollout":  # velocity control
                         self._arm.vc_set_joint_velocity([0, 0, 0, 0, 0, 0, 0], is_radian=True, is_sync=False, duration=0)
                     rate.sleep()
                     # time.sleep(max(0, self.COMMAND_CHECK_INTERVAL - (time.time() - start_time)))
@@ -525,7 +525,7 @@ class XarmController(mp.Process):
                         if self.command_mode == 'cartesian':
                             self.move(command)
 
-                        if self.command_mode == 'joints':
+                        if self.command_mode == 'joints' or self.command_mode == "rollout":
                             command_state = np.array(command)
 
                             assert len(command_state) == 8, "command state must be 8-dim"
