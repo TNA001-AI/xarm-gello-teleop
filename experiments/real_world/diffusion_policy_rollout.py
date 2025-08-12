@@ -20,8 +20,8 @@ Inputs:
     - Hand joint states (from ROS2, 17 DOF)
 
 Outputs:
-    - xArm joint commands (via UDP to XarmController child process, 7 DOF + gripper placeholder)
-    - Hand joint commands (via ROS2, 16 DOF)
+    - xArm joint commands (via UDP to XarmController child process)
+    - Hand joint commands (via ROS2, 17 DOF)
 """
 
 import sys
@@ -40,12 +40,23 @@ from collections import deque
 
 # Add project root to path
 sys.path.append(str(Path(__file__).parent))
+sys.path.append(str(Path(__file__).parent.parent.parent))  # Add root for absolute imports
 
 # Import teleoperation modules
 from modules_teleop.xarm_controller import XarmController
 from camera.multi_realsense import MultiRealsense
 from utils import get_root, mkdir
 from multiprocess.managers import SharedMemoryManager
+import pickle
+import transforms3d
+
+# Import kinematics helper
+try:
+    from modules_teleop.kinematics_utils import KinHelper
+    KINEMATICS_AVAILABLE = True
+except ImportError as e:
+    print(f"Warning: KinHelper not available: {e}")
+    KINEMATICS_AVAILABLE = False
 
 # NEW: UDP sender and ports to talk to the XarmController child process
 from modules_teleop.udp_util import udpSender
@@ -57,8 +68,9 @@ CHECK_POINT_PATH = "/data/xarm_orca_diffusion/checkpoints/last/pretrained_model"
 try:
     import rclpy
     from rclpy.node import Node
-    from std_msgs.msg import Float64MultiArray
     ROS2_AVAILABLE = True
+    from sensor_msgs.msg import JointState
+    from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 except ImportError:
     print("Warning: ROS2 not available, hand control disabled")
     ROS2_AVAILABLE = False
@@ -69,6 +81,7 @@ try:
     from lerobot.configs.policies import PreTrainedConfig
     from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
     from lerobot.datasets.factory import resolve_delta_timestamps
+    from typing import Optional, Dict, Any
     LEROBOT_AVAILABLE = True
 except ImportError:
     print("Warning: LeRobot not available")
@@ -76,46 +89,114 @@ except ImportError:
 
 
 class HandController(Node):
-    """ROS2 Node for controlling hand joints"""
+    """
+    Minimal ROS2 bridge.
+
+    send_hand_command(hand_16, wrist_rad=None)
+      - hand_16: numpy array of 16 finger joint radians in RIGHT_NAMES_16 order
+      - wrist_rad: optional radians value; published as the 8th joint
+        to /gello/act_joint_states
+
+    get_hand_state()
+      - returns a dict with:
+          {
+            "fingers": np.ndarray(16) or None,   # in RIGHT_NAMES_16 order if all present
+            "wrist": float or None,              # if present in obs
+            "raw": {"names": [...], "positions": [...]},  # raw JointState mirror
+          }
+    """
+
+    # Exact publish order expected by your hardware on /joint_states (16 dims)
+    RIGHT_NAMES_16 = [
+        "right_thumb_mcp", "right_thumb_abd", "right_thumb_pip", "right_thumb_dip",
+        "right_index_mcp", "right_index_pip", "right_index_abd",
+        "right_middle_mcp", "right_middle_pip", "right_middle_abd",
+        "right_ring_mcp", "right_ring_pip", "right_ring_abd",
+        "right_pinky_mcp", "right_pinky_pip", "right_pinky_abd",
+    ]
 
     def __init__(self):
-        super().__init__('hand_controller')
+        super().__init__("hand_controller")
 
-        # Publishers for hand control
-        self.act_hand_pub = self.create_publisher(
-            Float64MultiArray,
-            '/orca_hand/act_joint_states',
-            10
+        qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=10,
         )
 
-        # Subscribers for hand observation
-        self.obs_hand_sub = self.create_subscription(
-            Float64MultiArray,
-            '/orca_hand/obs_joint_states',
-            self.obs_hand_callback,
-            10
+        # Command publishers
+        self.joint_cmd_pub = self.create_publisher(JointState, "/joint_states", qos)
+        self.wrist_cmd_pub = self.create_publisher(JointState, "/gello/act_joint_states", qos)
+
+        # Observation subscriber (whatever Orca publishes)
+        self.obs_sub = self.create_subscription(
+            JointState, "/orca_hand/obs_joint_states", self._obs_cb, qos
         )
 
-        self.current_hand_state = None
-        self.hand_state_lock = threading.Lock()
+        self._last_obs_names: list[str] = []
+        self._last_obs_pos: list[float] = []
+        self._lock = threading.Lock()
 
-    def obs_hand_callback(self, msg):
-        """Callback for receiving hand observations"""
-        with self.hand_state_lock:
-            self.current_hand_state = np.array(msg.data)
+    # -------- Observation --------
+    def _obs_cb(self, msg: JointState):
+        with self._lock:
+            self._last_obs_names = list(msg.name)
+            # ensure float
+            self._last_obs_pos = [float(p) for p in msg.position]
 
     def get_hand_state(self) -> Optional[np.ndarray]:
-        """Get current hand joint state"""
-        with self.hand_state_lock:
-            if self.current_hand_state is not None:
-                return self.current_hand_state.copy()
+        """Return latest observation as numpy array of 17 DOF (16 fingers + 1 wrist) for policy rollout."""
+        with self._lock:
+            names = list(self._last_obs_names)
+            pos = list(self._last_obs_pos)
+
+        if not names:
             return None
 
-    def send_hand_command(self, hand_joints: np.ndarray):
-        """Send hand joint commands"""
-        msg = Float64MultiArray()
-        msg.data = hand_joints.tolist()
-        self.act_hand_pub.publish(msg)
+        name_to_pos = {n: p for n, p in zip(names, pos)}
+
+        # Try to assemble fingers in RIGHT_NAMES_16 order
+        try:
+            fingers = np.array([name_to_pos[n] for n in self.RIGHT_NAMES_16], dtype=np.float32)
+        except KeyError:
+            # Some finger names missing; return None to use zeros
+            return None
+
+        # Wrist is optional; use 0.0 if not present
+        wrist = name_to_pos.get("wrist", 0.0)
+        wrist = float(wrist)
+
+        # Combine into 17 DOF: 16 fingers + 1 wrist
+        hand_state = np.concatenate([fingers, np.array([wrist], dtype=np.float32)])
+        
+        return hand_state
+
+    # -------- Command --------
+    def send_hand_command(self, hand_joints: np.ndarray, wrist_rad: Optional[float] = None):
+        """
+        Publish 16 finger joints (radians) in RIGHT_NAMES_16 order to /joint_states,
+        and optionally publish wrist (as the 8th joint) to /gello/act_joint_states.
+        """
+        hand = np.asarray(hand_joints, dtype=np.float32).flatten()
+        if hand.size != 16:
+            raise ValueError(f"hand_joints must have 16 elements (got {hand.size})")
+
+        # Fingers -> /joint_states
+        js = JointState()
+        js.header.stamp = self.get_clock().now().to_msg()
+        js.name = list(self.RIGHT_NAMES_16)
+        js.position = hand.tolist()
+        self.joint_cmd_pub.publish(js)
+
+        # Optional wrist -> /gello/act_joint_states (index 7)
+        if wrist_rad is not None:
+            wmsg = JointState()
+            wmsg.header.stamp = self.get_clock().now().to_msg()
+            pos = [0.0] * 8
+            pos[7] = float(wrist_rad)
+            wmsg.position = pos
+            self.wrist_cmd_pub.publish(wmsg)
+
 
 
 class DiffusionPolicyRollout:
@@ -160,10 +241,8 @@ class DiffusionPolicyRollout:
 
         # Latest robot joints cache for composing absolute targets
         self._last_xarm_joints: Optional[np.ndarray] = None
+        self._last_wrist_state: Optional[float] = None
 
-        # Data buffers (kept for status display; not used for policy history anymore)
-        self.observation_buffer = deque(maxlen=history_length)
-        self.action_buffer = deque(maxlen=action_horizon)
         self.step_count = 0
 
         # Control flags
@@ -175,6 +254,17 @@ class DiffusionPolicyRollout:
         self.display_queue = deque(maxlen=10)
         self.coordinate_history = deque(maxlen=100)
         self.predicted_coordinates = None
+        
+        # Camera calibration data for end effector visualization
+        self.camera_intrinsics = None
+        self.camera_extrinsics = None
+        self.robot_base_to_world = None
+        
+        # Forward kinematics helper
+        self.kin_helper = None
+        
+        # End effector point in gripper frame - 22cm Z offset
+        self.eef_point = np.array([[0.0, 0.0, 0.22]])  # 22cm Z offset
 
         # Latest single-step observation cache
         self.image_feature_keys = None  # to be filled from policy config
@@ -258,6 +348,54 @@ class DiffusionPolicyRollout:
         else:
             print("ROS2 not available, hand control disabled")
 
+    def load_camera_calibration(self):
+        """Load camera calibration data for end effector visualization"""
+        try:
+            calibration_dir = self.root / "log" / "latest_calibration"
+            
+            # Load base calibration (robot base to world transform)
+            with open(calibration_dir / "base.pkl", 'rb') as f:
+                base = pickle.load(f)
+            R_base2world = base['R_base2world']
+            t_base2world = base['t_base2world']
+            base2world_mat = np.eye(4)
+            base2world_mat[:3, :3] = R_base2world
+            base2world_mat[:3, 3] = t_base2world
+            self.robot_base_to_world = base2world_mat
+            
+            # Load camera extrinsics
+            with open(calibration_dir / "rvecs.pkl", 'rb') as f:
+                rvecs = pickle.load(f)
+            with open(calibration_dir / "tvecs.pkl", 'rb') as f:
+                tvecs = pickle.load(f)
+            
+            print(f"Loading calibration for camera system with {len(self.camera_system.cameras)} cameras")
+            print(f"Available calibration keys: {list(rvecs.keys())}")
+            
+            extr_list = []
+            serial_numbers = list(self.camera_system.cameras.keys())
+            for serial in serial_numbers:
+                if serial in rvecs:
+                    R_world2cam = cv2.Rodrigues(rvecs[serial])[0]
+                    t_world2cam = tvecs[serial][:, 0]
+                    extr_mat = np.eye(4)
+                    extr_mat[:3, :3] = R_world2cam
+                    extr_mat[:3, 3] = t_world2cam
+                    extr_list.append(extr_mat)
+                else:
+                    print(f"Warning: No calibration data found for camera {serial}")
+                    extr_list.append(np.eye(4))  # Identity as fallback
+            
+            self.camera_extrinsics = np.stack(extr_list) if extr_list else None
+            
+            print("Camera calibration loaded successfully")
+            
+        except Exception as e:
+            print(f"Warning: Failed to load camera calibration: {e}")
+            print("End effector visualization will be disabled")
+            self.camera_extrinsics = None
+            self.robot_base_to_world = None
+
     def setup_cameras(self):
         """Initialize camera system (resolution aligned with policy config)"""
         print("Setting up cameras...")
@@ -287,8 +425,287 @@ class DiffusionPolicyRollout:
         print("Setting camera exposure and white balance...")
         self.camera_system.set_exposure(exposure=100, gain=60)  # 100: bright, 60: dark
         self.camera_system.set_white_balance(3800)
+        
+        # Load camera calibration after camera system is initialized
+        self.load_camera_calibration()
+        
+        # Initialize forward kinematics helper
+        if KINEMATICS_AVAILABLE:
+            try:
+                self.kin_helper = KinHelper(robot_name='xarm7', headless=True)
+                print("Forward kinematics helper initialized")
+            except Exception as e:
+                print(f"Warning: Failed to initialize kinematics helper: {e}")
+                self.kin_helper = None
+        else:
+            print("Warning: Kinematics utilities not available, end effector visualization will be disabled")
+            self.kin_helper = None
+        
+        # Note: Camera intrinsics will be loaded after camera system starts
 
     # ---------------- Observation helpers (single-step) ----------------
+
+    def draw_end_effector_frame(self, images: Dict[str, np.ndarray], joints: np.ndarray, is_predicted: bool = True) -> Dict[str, np.ndarray]:
+        """
+        Draw end effector frame on camera images using forward kinematics.
+        Args:
+            images: Dict of camera serial -> {'color': HxWx3 BGR image}
+            joints: (7,) array of joint angles in radians
+            is_predicted: True for predicted frame (RGB axes), False for current frame (different colors)
+        Returns:
+            Dict of camera serial -> {'color': HxWx3 BGR image with visualization}
+        """
+        # Check what components are available
+        components_status = {
+            'kin_helper': self.kin_helper is not None,
+            'camera_extrinsics': self.camera_extrinsics is not None,
+            'robot_base_to_world': self.robot_base_to_world is not None,
+            'camera_intrinsics': self.camera_intrinsics is not None
+        }
+        
+        if (self.kin_helper is None or 
+            self.camera_extrinsics is None or 
+            self.robot_base_to_world is None or 
+            self.camera_intrinsics is None):
+            return images  # Return original images if calibration not available
+        
+        try:
+            # Compute forward kinematics for joint angles
+            eef_pose = self.kin_helper.compute_fk_sapien_links(
+                joints, [self.kin_helper.sapien_eef_idx]
+            )[0]  # 4x4 transformation matrix
+            
+            # Transform end effector points to world coordinates (matching teleop.py approach)
+            eef_points_gripper = np.concatenate([self.eef_point, np.ones((self.eef_point.shape[0], 1))], axis=1)  # (n, 4)
+            eef_points_world = (self.robot_base_to_world @ eef_pose @ eef_points_gripper.T).T[:, :3]  # (n, 3)
+            eef_points_world_vis = np.concatenate([eef_points_world, np.ones((eef_points_world.shape[0], 1))], axis=1)  # (n, 4)
+            
+            # Set colors and style based on frame type
+            if is_predicted:
+                # Predicted frame: RGB colors, thinner lines
+                eef_axis_colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]  # BGR: Red, Green, Blue for X, Y, Z
+                circle_color = (0, 255, 255)  # Yellow circle
+                circle_radius = 2
+                line_thickness = 2
+                axis_length = 0.1  # 10cm
+            else:
+                # Current frame: Different colors, thicker lines
+                eef_axis_colors = [(255, 0, 255), (255, 255, 0), (0, 255, 255)]  # BGR: Magenta, Cyan, Yellow for X, Y, Z
+                circle_color = (255, 255, 255)  # White circle
+                circle_radius = 3
+                line_thickness = 3
+                axis_length = 0.05  # 5cm (shorter)
+            
+            # Define end effector axes for visualization (same as teleop.py)
+            eef_axis = np.array([[0.1, 0, 0], [0, 0.1, 0], [0, 0, 0.1]])  # X, Y, Z axes scaled to 10cm
+            eef_axis_colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]  # BGR: Red, Green, Blue for X, Y, Z
+            
+            # Draw on each camera image
+            annotated_images = {}
+            camera_serials = list(images.keys())
+            
+            for idx, (serial, img_data) in enumerate(images.items()):
+                img = img_data['color'].copy()  # Copy to avoid modifying original
+                
+                if idx >= len(self.camera_extrinsics) or idx >= len(self.camera_intrinsics):
+                    annotated_images[serial] = {'color': img}
+                    continue
+                
+                extr = self.camera_extrinsics[idx]  # World to camera transform
+                intr = self.camera_intrinsics[idx]   # Camera intrinsic matrix
+                
+                # Project end effector point to image (matching teleop.py exactly)
+                point = eef_points_world_vis[0]  # (4,) - already has homogeneous coordinate
+                point = extr @ point  # Transform to camera coordinates
+                
+                if point[2] > 0:  # Check if in front of camera
+                    point = point[:3] / point[2]  # Perspective division
+                    point = intr @ point  # Apply intrinsics
+                    
+                    # Draw circle with bounds checking for visibility
+                    x, y = int(point[0]), int(point[1])
+                    
+                    # Draw the circle even if outside bounds, but clamp for visibility
+                    if 0 <= x < img.shape[1] and 0 <= y < img.shape[0]:
+                        # Normal case: point is within image
+                        cv2.circle(img, (x, y), circle_radius, circle_color, -1)
+                    else:
+                        # Point is outside image - draw at clamped position
+                        x_clamped = max(5, min(x, img.shape[1] - 5))
+                        y_clamped = max(5, min(y, img.shape[0] - 5))
+                        cv2.circle(img, (x_clamped, y_clamped), circle_radius + 1, circle_color, -1)
+                
+                # Draw end effector axes (matching teleop.py approach)
+                eef_axis_teleop = np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]])  # (3, 4) format like teleop
+                point_orig = eef_points_gripper[0]  # Original point in gripper frame (4,)
+                
+                for axis, color in zip(eef_axis_teleop, eef_axis_colors):
+                    # Create axis endpoint (matching teleop.py)
+                    eef_point_axis = point_orig + axis_length * axis  # Variable axis length
+                    eef_point_axis_world = (self.robot_base_to_world @ eef_pose @ eef_point_axis)
+                    eef_point_axis_world = extr @ eef_point_axis_world
+                    
+                    if point[2] > 0 and eef_point_axis_world[2] > 0:
+                        eef_point_axis_world = eef_point_axis_world[:3] / eef_point_axis_world[2]
+                        eef_point_axis_world = intr @ eef_point_axis_world
+                        
+                        # Draw line from origin to axis endpoint
+                        origin_x, origin_y = int(point[0]), int(point[1])
+                        axis_x, axis_y = int(eef_point_axis_world[0]), int(eef_point_axis_world[1])
+                        
+                        # Clamp line endpoints to image bounds for visibility
+                        origin_x = max(0, min(origin_x, img.shape[1] - 1))
+                        origin_y = max(0, min(origin_y, img.shape[0] - 1))
+                        axis_x = max(0, min(axis_x, img.shape[1] - 1))
+                        axis_y = max(0, min(axis_y, img.shape[0] - 1))
+                        
+                        cv2.line(img, (origin_x, origin_y), (axis_x, axis_y), color, line_thickness)
+                
+                # Always draw a test circle to verify drawing works
+                # cv2.circle(img, (img.shape[1]//2, img.shape[0]//2), 10, (255, 0, 255), 2)  # Magenta test circle
+                
+                # Draw step counter
+                cv2.putText(img, f"Step: {self.step_count}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                
+                annotated_images[serial] = {'color': img}
+            
+            return annotated_images
+            
+        except Exception as e:
+            print(f"Warning: Failed to draw predicted end effector: {e}")
+            import traceback
+            traceback.print_exc()
+            return images  # Return original images on error
+
+
+    def draw_trajectory_3d_window(self, action_sequence: np.ndarray, current_joints: np.ndarray):
+        """
+        Display trajectory in a BLOCKING Open3D window showing all 16 trajectory points.
+        Window will pause execution until closed.
+        """
+        print(f"[3D TRAJECTORY] Showing trajectory with {action_sequence.shape[0]} action steps")
+        
+        if self.kin_helper is None or self.robot_base_to_world is None:
+            print("[3D TRAJECTORY] Missing required components")
+            return
+        
+        try:
+            import open3d as o3d
+            
+            # Compute ALL 16 trajectory points (or however many are in action_sequence)
+            trajectory_points = []
+            trajectory_frames = []
+            cumulative_joints = current_joints.copy()
+            
+            # Add current position as starting point
+            current_eef_pose = self.kin_helper.compute_fk_sapien_links(
+                current_joints, [self.kin_helper.sapien_eef_idx]
+            )[0]
+            eef_point_gripper = np.concatenate([self.eef_point[0], [1]])
+            current_eef_world = (self.robot_base_to_world @ current_eef_pose @ eef_point_gripper)[:3]
+            trajectory_points.append(current_eef_world)
+            trajectory_frames.append(self.robot_base_to_world @ current_eef_pose)
+            
+            # Compute trajectory points
+            num_steps = action_sequence.shape[0]  # Use all available steps
+            print(f"[3D TRAJECTORY] Computing {num_steps} trajectory steps")
+            
+            for step_idx in range(num_steps):
+                gello_deltas = action_sequence[step_idx, 16:24][:7]
+                
+                # Check if actions are deltas or absolute positions
+                if step_idx == 0:
+                    delta_magnitude = np.linalg.norm(gello_deltas)
+                    print(f"[3D TRAJECTORY] First action magnitude: {delta_magnitude:.4f}")
+                    if delta_magnitude > 1.0:
+                        print("[3D TRAJECTORY] WARNING: Large action magnitude suggests absolute positions, not deltas!")
+                
+                cumulative_joints = cumulative_joints + gello_deltas
+                
+                eef_pose = self.kin_helper.compute_fk_sapien_links(
+                    cumulative_joints, [self.kin_helper.sapien_eef_idx]
+                )[0]
+                
+                eef_point_world = (self.robot_base_to_world @ eef_pose @ eef_point_gripper)[:3]
+                trajectory_points.append(eef_point_world)
+                trajectory_frames.append(self.robot_base_to_world @ eef_pose)
+            
+            trajectory_points = np.array(trajectory_points)
+            print(f"[3D TRAJECTORY] Created {len(trajectory_points)} trajectory points")
+            print(f"[3D TRAJECTORY] Trajectory spans from {trajectory_points[0]} to {trajectory_points[-1]}")
+            
+            # Create geometries for visualization
+            geometries = []
+            
+           
+            # 2. Robot base frame (make it more prominent with larger size and different color)
+            base_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.15)
+            base_frame.transform(self.robot_base_to_world)
+            geometries.append(base_frame)
+            
+            
+            
+            # 3. Current/Start end effector frame (green)
+            current_ee_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)
+            current_ee_frame.transform(trajectory_frames[0])
+            current_ee_frame.paint_uniform_color([0, 1, 0])
+            geometries.append(current_ee_frame)
+            
+        
+            
+            # 4. Final/End end effector frame (red)
+            if len(trajectory_frames) > 1:
+                final_ee_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)
+                final_ee_frame.transform(trajectory_frames[-1])
+                final_ee_frame.paint_uniform_color([1, 0, 0])
+                geometries.append(final_ee_frame)
+                
+                
+
+            
+            # BLOCKING visualization - execution will pause until window is closed
+            print(f"[3D TRAJECTORY] Opening BLOCKING Open3D window with {len(geometries)} geometries")
+            print(f"[3D TRAJECTORY] Showing all {len(trajectory_points)} trajectory points")
+            print("[3D TRAJECTORY] Frame Labels: WORLD=Yellow, BASE=Cyan, START=Green, END=Red")
+            print("[3D TRAJECTORY] Close the window to continue execution...")
+            
+            # Use blocking draw_geometries - this will pause execution
+            window_title = (f"Robot Trajectory Visualization | Step {self.step_count} ")
+            
+            # Create visualizer with custom view settings
+            vis = o3d.visualization.Visualizer()
+            vis.create_window(window_name=window_title, width=1200, height=900, left=100, top=100)
+            
+            # Add all geometries
+            for geom in geometries:
+                vis.add_geometry(geom)
+            
+            # Set camera to look at robot base with proper orientation
+            ctr = vis.get_view_control()
+            
+            # Set the center of view to robot base position
+            base_position = self.robot_base_to_world[:3, 3] if self.robot_base_to_world is not None else np.array([0, 0, 0])
+            ctr.set_lookat(base_position + [0,0,-0.3])
+            
+            # Set camera position: X to the right, Z up
+            # Camera should be positioned to have a good view with X pointing right and Z up
+            # Front vector: looking from diagonal position
+            ctr.set_front([0.3, -0.7, 0])  # Look from front-right, slightly above
+            
+            # Up vector: Z axis points up in view
+            ctr.set_up([0, 0, -1])
+            
+            # Set zoom to see the full trajectory
+            ctr.set_zoom(0.9)
+            
+            # Render and run
+            vis.run()
+            vis.destroy_window()
+            
+            print(f"[3D TRAJECTORY] Window closed, continuing execution")
+            
+        except Exception as e:
+            print(f"[3D TRAJECTORY ERROR] {e}")
 
     def preprocess_images_single(self, images: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
         """
@@ -366,9 +783,9 @@ class DiffusionPolicyRollout:
             if self.hand_controller is not None:
                 hand_joints = self.hand_controller.get_hand_state()
                 if hand_joints is None:
-                    hand_joints = np.zeros(17)
+                    hand_joints = np.zeros(17, dtype=np.float32)
             else:
-                hand_joints = np.zeros(17)
+                hand_joints = np.zeros(17, dtype=np.float32)
 
             # Assert hand joint dimensions
             assert isinstance(hand_joints, np.ndarray), f"Expected numpy array for hand joints, got {type(hand_joints)}"
@@ -411,9 +828,18 @@ class DiffusionPolicyRollout:
             # Visualization: store predicted deltas for first 7 joints
             self.predicted_coordinates = gello_actions[:7]
 
-            # Send hand commands (16 DOF) via ROS2 (if available)
+            # Send hand commands (16 DOF) + wrist via ROS2 (if available)
             if self.hand_controller is not None:
-                self.hand_controller.send_hand_command(hand_actions)
+                # Extract wrist command from gello_actions (if available) or use current wrist state
+                wrist_cmd = None
+                if len(gello_actions) >= 8:  # gello has 8 DOF, 8th might be wrist
+                    wrist_cmd = float(gello_actions[7])  # Use 8th gello joint as wrist command
+                else:
+                    # Fallback: use current wrist state if available
+                    if self._last_xarm_joints is not None and hasattr(self, '_last_wrist_state'):
+                        wrist_cmd = self._last_wrist_state
+                
+                self.hand_controller.send_hand_command(hand_actions, wrist_rad=wrist_cmd)
 
             # Send xArm joint command via UDP to child process (absolute 8-dim: 7 joints + 1 gripper placeholder)
             if self.xarm_cmd_sender is not None:
@@ -542,7 +968,7 @@ class DiffusionPolicyRollout:
                     screen.blit(pred_text, (pred_panel_x + 10, pred_panel_y + y_offset + i * 25))
 
             # Status information
-            status_text = f"Step: {self.step_count} | Obs Buffer: {len(self.observation_buffer)} | Action Buffer: {len(self.action_buffer)}"
+            status_text = f"Step: {self.step_count} | Coord History: {len(self.coordinate_history)}"
             status_surface = small_font.render(status_text, True, BLACK)
             screen.blit(status_surface, (20, screen.get_height() - 30))
 
@@ -560,7 +986,7 @@ class DiffusionPolicyRollout:
         """Run the diffusion policy rollout"""
         # Create data directories
         data_dir = self.root / "log" / "data" / self.exp_name
-        mkdir(data_dir, overwrite=False, resume=False)
+        mkdir(data_dir, overwrite=True, resume=False)
         print(f"Starting diffusion policy rollout for {duration} seconds...")
 
         # Setup all systems
@@ -594,6 +1020,14 @@ class DiffusionPolicyRollout:
             # Check if cameras are ready
             if not self.camera_system.is_ready:
                 print("Warning: Camera system not ready, continuing with limited functionality")
+            else:
+                # Load camera intrinsics now that cameras are ready
+                try:
+                    self.camera_intrinsics = self.camera_system.get_intrinsics()
+                    print("Camera intrinsics loaded successfully")
+                except Exception as e:
+                    print(f"Warning: Failed to load camera intrinsics: {e}")
+                    self.camera_intrinsics = None
         except Exception as e:
             print(f"Warning: Camera initialization failed: {e}")
             print("Continuing without camera data...")
@@ -658,6 +1092,11 @@ class DiffusionPolicyRollout:
                     current_joints = robot_state['observation.xarm_joint_pos']
                     self.coordinate_history.append(current_joints)
                     self._last_xarm_joints = current_joints  # cache for execute_actions()
+                    
+                    # Cache wrist state (17th DOF of hand state)
+                    hand_state = robot_state['observation.hand_joint_pos']
+                    if len(hand_state) >= 17:
+                        self._last_wrist_state = float(hand_state[16])  # 17th element is wrist
 
                     # Preprocess single-frame observations mapped to policy keys
                     processed_images = self.preprocess_images_single(images)
@@ -678,14 +1117,84 @@ class DiffusionPolicyRollout:
                             with torch.no_grad():
                                 action = self.policy.select_action(batch)
 
-                            # Convert to numpy and execute
+                            # IMPORTANT: Unnormalize policy outputs BEFORE converting to numpy
+                            # This was missing and causing huge deltas like 1.313 radians!
+                            if hasattr(self.policy, 'unnormalize_outputs') and isinstance(action, torch.Tensor):
+                                try:
+                                    # Unnormalize while still tensor on correct device
+                                    unnormalized = self.policy.unnormalize_outputs({"action": action})
+                                    action = unnormalized["action"]
+                                    print(f"[DEBUG] Step {self.step_count}: Unnormalized action successfully")
+                                except Exception as e:
+                                    print(f"[WARNING] Step {self.step_count}: Failed to unnormalize actions: {e}")
+                                    print("Using raw normalized actions - this may cause large movements!")
+                            elif not hasattr(self.policy, 'unnormalize_outputs'):
+                                print(f"[WARNING] Step {self.step_count}: Policy has no unnormalize_outputs method - using raw actions")
+                            
+                            # Convert to numpy after unnormalization
                             if isinstance(action, torch.Tensor):
                                 action = action.detach().cpu().numpy()
-                            if action.ndim == 2:
+                            
+                            print(f"[DEBUG] Step {self.step_count}: Raw action shape: {action.shape}")
+                            
+                            # Handle different policy output formats
+                            if action.ndim == 3:
+                                # Shape: (batch, action_horizon, action_dim) - typical for diffusion policies
                                 assert action.shape[0] == 1, f"Expected batch size 1, got {action.shape[0]}"
-                                action = action[0]
-                            assert action.ndim == 1 and action.shape[0] == 24, f"Expected 24-dim action, got {action.shape}"
-                            self.execute_actions(action)
+                                action_sequence = action[0]  # Remove batch dimension: (action_horizon, action_dim)
+                                current_action = action_sequence[0]  # First action for immediate execution
+                                print(f"[DEBUG] Step {self.step_count}: Action sequence shape: {action_sequence.shape}")
+                            elif action.ndim == 2:
+                                if action.shape[0] == 1:
+                                    # Shape: (1, action_dim) - single action
+                                    current_action = action[0]
+                                    action_sequence = action[0:1]  # Keep as sequence of 1
+                                else:
+                                    # Shape: (action_horizon, action_dim) - sequence without batch
+                                    action_sequence = action
+                                    current_action = action[0]
+                                print(f"[DEBUG] Step {self.step_count}: Action sequence shape: {action_sequence.shape}")
+                            elif action.ndim == 1:
+                                # Shape: (action_dim,) - single action
+                                current_action = action
+                                action_sequence = action.reshape(1, -1)  # Convert to sequence of 1
+                                print(f"[DEBUG] Step {self.step_count}: Single action converted to sequence: {action_sequence.shape}")
+                            else:
+                                raise ValueError(f"Unexpected action shape: {action.shape}")
+                            
+                            assert current_action.ndim == 1 and current_action.shape[0] == 24, f"Expected 24-dim current action, got {current_action.shape}"
+                            
+                            # Visualize current frame, predicted trajectory, and immediate next frame
+                            if self._last_xarm_joints is not None:
+                                # Extract current action for immediate execution
+                                hand_actions = current_action[:16]
+                                gello_actions = current_action[16:24]
+                                predicted_joints = self._last_xarm_joints + gello_actions[:7]  # Add deltas to current joints
+                                
+                                # Start with original images
+                                annotated_images = images.copy()
+                                
+                                # Draw current end effector frame (for debugging)
+                                annotated_images = self.draw_end_effector_frame(annotated_images, self._last_xarm_joints, is_predicted=False)
+                                
+                                # ALWAYS show trajectory visualization (blocking)
+                                print(f"[VIZ] Showing trajectory with {action_sequence.shape[0]} action steps")
+                                # Call the blocking 3D visualization directly
+                                self.draw_trajectory_3d_window(action_sequence, self._last_xarm_joints)
+                                
+                                # Draw immediate next frame (first predicted step) on top of everything
+                                annotated_images = self.draw_end_effector_frame(annotated_images, predicted_joints, is_predicted=True)
+                                
+                                # Update display queue with fully annotated images
+                                if annotated_images:
+                                    display_data = {
+                                        'images': annotated_images,
+                                        'robot_state': robot_state,
+                                        'timestamp': time.time()
+                                    }
+                                    self.display_queue.append(display_data)
+                            
+                            self.execute_actions(current_action)
                     except Exception as e:
                         print(f"Error in select_action step: {e}")
 
@@ -700,8 +1209,7 @@ class DiffusionPolicyRollout:
                     has_images = len(images) > 0
                     has_robot_state = robot_state is not None
                     print(f"Step {self.step_count}, Elapsed: {elapsed:.1f}s, "
-                          f"Obs buffer: {len(self.observation_buffer)}, "
-                          f"Action buffer: {len(self.action_buffer)}, "
+                          f"Coord history: {len(self.coordinate_history)}, "
                           f"Images: {has_images}, Robot state: {has_robot_state}")
 
                 # Maintain loop rate
@@ -762,7 +1270,7 @@ def main():
                        help="Experiment name for logging")
     parser.add_argument("--robot_ip", type=str, default="192.168.1.196",
                        help="xArm robot IP address")
-    parser.add_argument("--duration", type=float, default=60.0,
+    parser.add_argument("--duration", type=float, default=1000,
                        help="Rollout duration in seconds")
     parser.add_argument("--camera_serials", type=str, nargs="+", default=["239222300740", "239222303153"],
                        help="Camera serial numbers (uses auto-detection if not specified)")
@@ -772,7 +1280,7 @@ def main():
                        help="Image height for policy input (default: 240) [will be overridden by policy config]")
     parser.add_argument("--device", type=str, default="cuda",
                        help="Device for policy inference (cuda/cpu)")
-    parser.add_argument("--verbose", action="store_true",
+    parser.add_argument("--verbose", type=bool, default= False,
                        help="Enable verbose logging")
     parser.add_argument("--no_visualization", action="store_true",
                        help="Disable real-time visualization window")
