@@ -21,6 +21,7 @@ from lerobot.configs.default import DatasetConfig, WandBConfig
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.configs.types import FeatureType
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+import torch
 from lerobot.datasets.utils import dataset_to_policy_features, cycle
 from lerobot.datasets.transforms import ImageTransforms
 from lerobot.datasets.factory import resolve_delta_timestamps
@@ -52,7 +53,57 @@ TOLERANCE_S = 0.05
 STEPS = 100000
 BATCH_SIZE = 128
 NUM_WORKERS = 10
+DATASET_ROOT = "/data/lerobot_datasets"
 ## --------------------------------------- ##
+class SafeDatasetWrapper(torch.utils.data.Dataset):
+    """
+    Wrapper for LeRobotDataset that excludes the last frame of each episode
+    to avoid frame index out of bounds errors.
+    """
+    def __init__(self, dataset: LeRobotDataset, frames_to_exclude: int = 1):
+        self.dataset = dataset
+        self.frames_to_exclude = frames_to_exclude
+        
+        # Build a list of valid indices (excluding last N frames of each episode)
+        self.valid_indices = []
+        
+        for ep_idx in range(dataset.num_episodes):
+            ep_start = dataset.episode_data_index["from"][ep_idx].item()
+            ep_end = dataset.episode_data_index["to"][ep_idx].item()
+            
+            # Exclude the last N frames of this episode
+            safe_end = ep_end - frames_to_exclude
+            
+            # Add valid indices for this episode
+            for idx in range(ep_start, safe_end):
+                self.valid_indices.append(idx)
+        
+        print(f"SafeDatasetWrapper: Original dataset has {dataset.num_frames} frames")
+        print(f"SafeDatasetWrapper: After excluding {frames_to_exclude} frame(s) per episode, {len(self.valid_indices)} frames remain")
+        
+        # Copy attributes from original dataset
+        self.meta = dataset.meta
+        self.features = dataset.features
+        self.num_episodes = dataset.num_episodes
+        self.num_frames = len(self.valid_indices)
+        self.hf_dataset = dataset.hf_dataset
+        self.episode_data_index = dataset.episode_data_index
+        # Only copy stats if it exists
+        self.stats = getattr(dataset, 'stats', None)
+        self.fps = dataset.fps
+        self.video_backend = getattr(dataset, 'video_backend', None)
+        self.delta_timestamps = getattr(dataset, 'delta_timestamps', None)
+        # Copy tolerance_s if it exists
+        self.tolerance_s = getattr(dataset, 'tolerance_s', 0.05)
+    
+    def __len__(self):
+        return len(self.valid_indices)
+    
+    def __getitem__(self, idx):
+        # Map from wrapper index to original dataset index
+        original_idx = self.valid_indices[idx]
+        return self.dataset[original_idx]
+
 def update_policy(
     train_metrics: MetricsTracker,
     policy: PreTrainedPolicy,
@@ -143,6 +194,12 @@ def custom_train(cfg: TrainPipelineConfig):
     )
     
     logging.info(f"Dataset created successfully with tolerance_s={dataset.tolerance_s}")
+    
+    # Wrap dataset to exclude last frames of each episode (prevents frame index errors)
+    # This is necessary because video frames are 0-indexed and the last frame might
+    # cause index out of bounds when delta_timestamps look ahead
+    dataset = SafeDatasetWrapper(dataset, frames_to_exclude=2)  # Exclude last 2 frames for safety
+    logging.info(f"Applied SafeDatasetWrapper: {dataset.num_frames} frames available for training")
 
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
@@ -179,28 +236,16 @@ def custom_train(cfg: TrainPipelineConfig):
     logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
     logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
-    # create dataloader for offline training
-    if hasattr(cfg.policy, "drop_n_last_frames"):
-        shuffle = False
-        sampler = EpisodeAwareSampler(
-            dataset.episode_data_index,
-            drop_n_last_frames=cfg.policy.drop_n_last_frames,
-            shuffle=True,
-        )
-    else:
-        shuffle = True
-        sampler = None
 
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers        = cfg.num_workers,
         batch_size         = cfg.batch_size,
-        shuffle            = True if sampler is None else False,
-        sampler            = sampler,
+        shuffle            = True,
         pin_memory         = True,
         persistent_workers = True,
         prefetch_factor    = 6,         
-        drop_last          = False,
+        drop_last          = True,
     )
     dl_iter = cycle(dataloader)
 
@@ -315,7 +360,7 @@ def main():
     
     dataset_config = DatasetConfig(
         repo_id="tao_dataset",
-        root="/data/local_datasets",
+        root=DATASET_ROOT,
         image_transforms=image_transforms_config
     )
     
@@ -328,7 +373,7 @@ def main():
     )
     
     # Get dataset metadata to configure policy
-    dataset_metadata = LeRobotDatasetMetadata("tao_dataset", root=Path("/data/local_datasets"))
+    dataset_metadata = LeRobotDatasetMetadata("tao_dataset", root=Path(DATASET_ROOT))
     features = dataset_to_policy_features(dataset_metadata.features)
     output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
     input_features = {key: ft for key, ft in features.items() if key not in output_features}

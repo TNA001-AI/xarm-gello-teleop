@@ -48,7 +48,6 @@ from camera.multi_realsense import MultiRealsense
 from utils import get_root, mkdir
 from multiprocess.managers import SharedMemoryManager
 import pickle
-import transforms3d
 
 # Import kinematics helper
 try:
@@ -77,6 +76,7 @@ except ImportError:
 
 # LeRobot imports
 try:
+    from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
     from lerobot.policies.factory import make_policy
     from lerobot.configs.policies import PreTrainedConfig
     from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
@@ -208,24 +208,24 @@ class DiffusionPolicyRollout:
         exp_name: str = "diffusion_rollout",
         robot_ip: str = "192.168.1.196",
         camera_serial_numbers: Optional[list] = None,
-        image_width: int = 424,
-        image_height: int = 240,
         action_horizon: int = 16,
         history_length: int = 2,
         device: str = "cuda",
-        verbose: bool = True
+        verbose: bool = True,
+        debug: bool = True
     ):
         self.policy_path = Path(policy_path)
         self.exp_name = exp_name
         self.robot_ip = robot_ip
         self.camera_serial_numbers = camera_serial_numbers
-        self.image_width = image_width
-        self.image_height = image_height
-        self.image_resolution = (image_width, image_height)
+        self.image_width = None
+        self.image_height = None
+        self.image_resolution = None
         self.action_horizon = action_horizon
         self.history_length = history_length
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.verbose = verbose
+        self.debug = debug
 
         self.root = get_root(__file__)
 
@@ -285,18 +285,7 @@ class DiffusionPolicyRollout:
 
         try:
             # Load policy config
-            policy_config = PreTrainedConfig.from_pretrained(str(self.policy_path))
-            policy_config.pretrained_path = str(self.policy_path)
-
-            ds_meta = LeRobotDatasetMetadata(
-                "tao_dataset",
-                root="/data/local_datasets"
-            )
-
-            self.policy = make_policy(
-                cfg=policy_config,
-                ds_meta=ds_meta,
-            )
+            self.policy = DiffusionPolicy.from_pretrained(str(self.policy_path))
             self.policy.to(self.device)
             self.policy.eval()
 
@@ -308,7 +297,6 @@ class DiffusionPolicyRollout:
             self.image_resolution = (self.image_width, self.image_height)
 
             if self.verbose:
-                print("Policy loaded successfully using LeRobot make_policy with full dataset metadata including stats")
                 print(f"Image feature keys: {self.image_feature_keys}")
                 print(f"Policy expects image size (H,W) = ({self.image_height},{self.image_width})")
 
@@ -331,14 +319,8 @@ class DiffusionPolicyRollout:
         )
 
         # Prepare UDP sender to the controller's intake port
-        try:
-            port = XARM_CONTROL_PORT_L if self.xarm_controller.robot_id <= 0 else XARM_CONTROL_PORT_R
-            self.xarm_cmd_sender = udpSender(port=port)
-            if self.verbose:
-                print(f"[xarm] UDP sender ready on port {port}, robot_id={self.xarm_controller.robot_id}")
-        except Exception as e:
-            print(f"Warning: failed to create xarm UDP sender: {e}")
-            self.xarm_cmd_sender = None
+        port = XARM_CONTROL_PORT_L if self.xarm_controller.robot_id <= 0 else XARM_CONTROL_PORT_R
+        self.xarm_cmd_sender = udpSender(port=port)
 
         # Initialize hand controller if ROS2 is available
         if ROS2_AVAILABLE:
@@ -369,8 +351,9 @@ class DiffusionPolicyRollout:
             with open(calibration_dir / "tvecs.pkl", 'rb') as f:
                 tvecs = pickle.load(f)
             
-            print(f"Loading calibration for camera system with {len(self.camera_system.cameras)} cameras")
-            print(f"Available calibration keys: {list(rvecs.keys())}")
+            if self.verbose:
+                print(f"Loading calibration for camera system with {len(self.camera_system.cameras)} cameras")
+                print(f"Available calibration keys: {list(rvecs.keys())}")
             
             extr_list = []
             serial_numbers = list(self.camera_system.cameras.keys())
@@ -388,7 +371,8 @@ class DiffusionPolicyRollout:
             
             self.camera_extrinsics = np.stack(extr_list) if extr_list else None
             
-            print("Camera calibration loaded successfully")
+            if self.verbose:
+                print("Camera calibration loaded successfully")
             
         except Exception as e:
             print(f"Warning: Failed to load camera calibration: {e}")
@@ -433,7 +417,8 @@ class DiffusionPolicyRollout:
         if KINEMATICS_AVAILABLE:
             try:
                 self.kin_helper = KinHelper(robot_name='xarm7', headless=True)
-                print("Forward kinematics helper initialized")
+                if self.verbose:
+                    print("Forward kinematics helper initialized")
             except Exception as e:
                 print(f"Warning: Failed to initialize kinematics helper: {e}")
                 self.kin_helper = None
@@ -467,6 +452,14 @@ class DiffusionPolicyRollout:
             self.camera_extrinsics is None or 
             self.robot_base_to_world is None or 
             self.camera_intrinsics is None):
+            # Debug: Show which components are missing
+            if self.verbose and self.step_count % 200 == 0:
+                missing = []
+                if self.kin_helper is None: missing.append("kin_helper")
+                if self.camera_extrinsics is None: missing.append("extrinsics")
+                if self.robot_base_to_world is None: missing.append("base_transform")
+                if self.camera_intrinsics is None: missing.append("intrinsics")
+                print(f"EE visualization disabled - missing: {missing}")
             return images  # Return original images if calibration not available
         
         try:
@@ -514,7 +507,7 @@ class DiffusionPolicyRollout:
                 extr = self.camera_extrinsics[idx]  # World to camera transform
                 intr = self.camera_intrinsics[idx]   # Camera intrinsic matrix
                 
-                # Project end effector point to image (matching teleop.py exactly)
+                # Project end effector point to image
                 point = eef_points_world_vis[0]  # (4,) - already has homogeneous coordinate
                 point = extr @ point  # Transform to camera coordinates
                 
@@ -525,22 +518,32 @@ class DiffusionPolicyRollout:
                     # Draw circle with bounds checking for visibility
                     x, y = int(point[0]), int(point[1])
                     
+                    # Debug: Print EE position occasionally
+                    if self.verbose and self.step_count % 100 == 0:
+                        in_bounds = 0 <= x < img.shape[1] and 0 <= y < img.shape[0]
+                        print(f"EE frame cam_{idx}: ({x}, {y}) depth={point[2]:.3f} in_bounds={in_bounds}")
+                    
                     # Draw the circle even if outside bounds, but clamp for visibility
                     if 0 <= x < img.shape[1] and 0 <= y < img.shape[0]:
                         # Normal case: point is within image
                         cv2.circle(img, (x, y), circle_radius, circle_color, -1)
                     else:
-                        # Point is outside image - draw at clamped position
+                        # Point is outside image - draw at clamped position with different color
                         x_clamped = max(5, min(x, img.shape[1] - 5))
                         y_clamped = max(5, min(y, img.shape[0] - 5))
-                        cv2.circle(img, (x_clamped, y_clamped), circle_radius + 1, circle_color, -1)
+                        # Use red for out-of-bounds predicted, magenta for out-of-bounds current
+                        out_of_bounds_color = (0, 0, 255) if is_predicted else (255, 0, 255)
+                        cv2.circle(img, (x_clamped, y_clamped), circle_radius + 1, out_of_bounds_color, -1)
                 
-                # Draw end effector axes (matching teleop.py approach)
+                # Draw end effector axes 
                 eef_axis_teleop = np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]])  # (3, 4) format like teleop
                 point_orig = eef_points_gripper[0]  # Original point in gripper frame (4,)
                 
+                # Always draw a small test circle to verify drawing works  
+                cv2.circle(img, (30, 30), 3, (0, 255, 255), -1)  # Yellow test dot every frame
+                
                 for axis, color in zip(eef_axis_teleop, eef_axis_colors):
-                    # Create axis endpoint (matching teleop.py)
+                    # Create axis endpoint
                     eef_point_axis = point_orig + axis_length * axis  # Variable axis length
                     eef_point_axis_world = (self.robot_base_to_world @ eef_pose @ eef_point_axis)
                     eef_point_axis_world = extr @ eef_point_axis_world
@@ -560,10 +563,7 @@ class DiffusionPolicyRollout:
                         axis_y = max(0, min(axis_y, img.shape[0] - 1))
                         
                         cv2.line(img, (origin_x, origin_y), (axis_x, axis_y), color, line_thickness)
-                
-                # Always draw a test circle to verify drawing works
-                # cv2.circle(img, (img.shape[1]//2, img.shape[0]//2), 10, (255, 0, 255), 2)  # Magenta test circle
-                
+                                
                 # Draw step counter
                 cv2.putText(img, f"Step: {self.step_count}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                 
@@ -572,10 +572,9 @@ class DiffusionPolicyRollout:
             return annotated_images
             
         except Exception as e:
-            print(f"Warning: Failed to draw predicted end effector: {e}")
-            import traceback
-            traceback.print_exc()
-            return images  # Return original images on error
+            if self.verbose:
+                print(f"Warning: EE frame drawing failed: {e}")
+            return images
 
 
     def draw_trajectory_3d_window(self, action_sequence: np.ndarray, current_joints: np.ndarray):
@@ -583,10 +582,8 @@ class DiffusionPolicyRollout:
         Display trajectory in a BLOCKING Open3D window showing all 16 trajectory points.
         Window will pause execution until closed.
         """
-        print(f"[3D TRAJECTORY] Showing trajectory with {action_sequence.shape[0]} action steps")
         
         if self.kin_helper is None or self.robot_base_to_world is None:
-            print("[3D TRAJECTORY] Missing required components")
             return
         
         try:
@@ -608,17 +605,10 @@ class DiffusionPolicyRollout:
             
             # Compute trajectory points
             num_steps = action_sequence.shape[0]  # Use all available steps
-            print(f"[3D TRAJECTORY] Computing {num_steps} trajectory steps")
             
             for step_idx in range(num_steps):
                 gello_deltas = action_sequence[step_idx, 16:24][:7]
                 
-                # Check if actions are deltas or absolute positions
-                if step_idx == 0:
-                    delta_magnitude = np.linalg.norm(gello_deltas)
-                    print(f"[3D TRAJECTORY] First action magnitude: {delta_magnitude:.4f}")
-                    if delta_magnitude > 1.0:
-                        print("[3D TRAJECTORY] WARNING: Large action magnitude suggests absolute positions, not deltas!")
                 
                 cumulative_joints = cumulative_joints + gello_deltas
                 
@@ -631,8 +621,6 @@ class DiffusionPolicyRollout:
                 trajectory_frames.append(self.robot_base_to_world @ eef_pose)
             
             trajectory_points = np.array(trajectory_points)
-            print(f"[3D TRAJECTORY] Created {len(trajectory_points)} trajectory points")
-            print(f"[3D TRAJECTORY] Trajectory spans from {trajectory_points[0]} to {trajectory_points[-1]}")
             
             # Create geometries for visualization
             geometries = []
@@ -664,10 +652,11 @@ class DiffusionPolicyRollout:
 
             
             # BLOCKING visualization - execution will pause until window is closed
-            print(f"[3D TRAJECTORY] Opening BLOCKING Open3D window with {len(geometries)} geometries")
-            print(f"[3D TRAJECTORY] Showing all {len(trajectory_points)} trajectory points")
-            print("[3D TRAJECTORY] Frame Labels: WORLD=Yellow, BASE=Cyan, START=Green, END=Red")
-            print("[3D TRAJECTORY] Close the window to continue execution...")
+            if self.verbose:
+                print(f"[3D TRAJECTORY] Opening BLOCKING Open3D window with {len(geometries)} geometries")
+                print(f"[3D TRAJECTORY] Showing all {len(trajectory_points)} trajectory points")
+                print("[3D TRAJECTORY] Frame Labels: WORLD=Yellow, BASE=Cyan, START=Green, END=Red")
+                print("[3D TRAJECTORY] Close the window to continue execution...")
             
             # Use blocking draw_geometries - this will pause execution
             window_title = (f"Robot Trajectory Visualization | Step {self.step_count} ")
@@ -702,10 +691,10 @@ class DiffusionPolicyRollout:
             vis.run()
             vis.destroy_window()
             
-            print(f"[3D TRAJECTORY] Window closed, continuing execution")
             
         except Exception as e:
-            print(f"[3D TRAJECTORY ERROR] {e}")
+            if self.verbose:
+                print(f"[3D TRAJECTORY ERROR] {e}")
 
     def preprocess_images_single(self, images: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
         """
@@ -713,19 +702,13 @@ class DiffusionPolicyRollout:
         Input: images = { <serial>: {'color': HxWx3 BGR} }
         Output: { <policy_key>: (3,H,W) float32 in [0,1] }  —— no batch dim
         """
-        if self.image_feature_keys is None:
-            raise RuntimeError("Policy not loaded yet; image_feature_keys unknown.")
-        processed = {}
 
         # Prefer explicit serial order from CLI to ensure mapping stability
-        camera_serials = self.camera_serial_numbers or list(images.keys())
-        if len(camera_serials) < len(self.image_feature_keys):
-            raise RuntimeError(f"Need >= {len(self.image_feature_keys)} cameras, got {len(camera_serials)}.")
+        camera_serials = self.camera_serial_numbers
+        processed = {}
 
         for idx, pol_key in enumerate(self.image_feature_keys):
             serial = camera_serials[idx]
-            if serial not in images:
-                raise RuntimeError(f"Expected camera serial {serial} in captured images, but missing.")
             img = images[serial]['color']  # HxWx3 (BGR)
             # Resize to policy input size
             img = cv2.resize(img, self.image_resolution)
@@ -737,8 +720,6 @@ class DiffusionPolicyRollout:
                 f"Expected (3,{self.image_height},{self.image_width}), got {img_t.shape}"
             processed[pol_key] = img_t
 
-        if self.verbose and self.camera_serial_numbers:
-            print("[cam->key map]", dict(zip(self.image_feature_keys, camera_serials[:len(self.image_feature_keys)])))
         return processed
 
     def create_step_batch(self) -> Optional[Dict[str, torch.Tensor]]:
@@ -755,52 +736,41 @@ class DiffusionPolicyRollout:
             batch[k] = self.latest_obs[k].unsqueeze(0).to(self.device)  # (1,C,H,W)
         # State
         batch['observation.state'] = self.latest_obs['observation.state'].unsqueeze(0).to(self.device)  # (1,D)
-        if self.verbose:
-            shapes = {k: tuple(v.shape) for k, v in batch.items() if 'observation.images' in k or k == 'observation.state'}
-            print(f"[DEBUG] step batch shapes: {shapes}")
         return batch
 
     # ---------------- Robot state ----------------
 
     def get_robot_state(self) -> Optional[Dict[str, np.ndarray]]:
         """Get current robot state with separate xarm and hand components"""
-        try:
-            # Get xArm joint state (7 DOF) from controller's queue
-            xarm_joints = None
-            if self.xarm_controller.is_controller_alive and not self.xarm_controller.cur_qpos_q.empty():
-                xarm_joints = self.xarm_controller.cur_qpos_q.get()
+        # Get xArm joint state (7 DOF) from controller's queue
+        xarm_joints = None
+        if self.xarm_controller.is_controller_alive and not self.xarm_controller.cur_qpos_q.empty():
+            xarm_joints = self.xarm_controller.cur_qpos_q.get()
 
-            if xarm_joints is None:
-                if self.step_count % 100 == 0:  # Only print occasionally
-                    print("Debug: xarm joint queue is empty or controller not alive")
-                return None
-
-            # Assert xArm joint dimensions
-            assert isinstance(xarm_joints, np.ndarray), f"Expected numpy array for xarm joints, got {type(xarm_joints)}"
-            assert xarm_joints.shape == (7,), f"Expected 7 DOF for xArm, got shape {xarm_joints.shape}"
-
-            # Get hand joint state (17 DOF for observation)
-            if self.hand_controller is not None:
-                hand_joints = self.hand_controller.get_hand_state()
-                if hand_joints is None:
-                    hand_joints = np.zeros(17, dtype=np.float32)
-            else:
-                hand_joints = np.zeros(17, dtype=np.float32)
-
-            # Assert hand joint dimensions
-            assert isinstance(hand_joints, np.ndarray), f"Expected numpy array for hand joints, got {type(hand_joints)}"
-            assert hand_joints.shape == (17,), f"Expected 17 DOF for hand, got shape {hand_joints.shape}"
-
-            robot_state = {
-                'observation.xarm_joint_pos': xarm_joints,
-                'observation.hand_joint_pos': hand_joints
-            }
-            return robot_state
-
-        except Exception as e:
-            if self.step_count % 100 == 0:
-                print(f"Error getting robot state: {e}")
+        if xarm_joints is None:
             return None
+
+        # Assert xArm joint dimensions
+        assert isinstance(xarm_joints, np.ndarray), f"Expected numpy array for xarm joints, got {type(xarm_joints)}"
+        assert xarm_joints.shape == (7,), f"Expected 7 DOF for xArm, got shape {xarm_joints.shape}"
+
+        # Get hand joint state (17 DOF for observation)
+        if self.hand_controller is not None:
+            hand_joints = self.hand_controller.get_hand_state()
+            if hand_joints is None:
+                hand_joints = np.zeros(17, dtype=np.float32)
+        else:
+            hand_joints = np.zeros(17, dtype=np.float32)
+
+        # Assert hand joint dimensions
+        assert isinstance(hand_joints, np.ndarray), f"Expected numpy array for hand joints, got {type(hand_joints)}"
+        assert hand_joints.shape == (17,), f"Expected 17 DOF for hand, got shape {hand_joints.shape}"
+
+        robot_state = {
+            'observation.xarm_joint_pos': xarm_joints,
+            'observation.hand_joint_pos': hand_joints
+        }
+        return robot_state
 
     # ---------------- Action execution ----------------
 
@@ -810,52 +780,46 @@ class DiffusionPolicyRollout:
           - Send hand commands over ROS2 (if available)
           - Compose absolute joint target for xArm and send via UDP to the XarmController child process
         """
-        try:
-            # Handle different action formats based on policy output
-            if isinstance(actions, dict):
-                hand_actions = actions.get('action.hand_joint_pos', np.zeros(16, dtype=np.float32))
-                gello_actions = actions.get('action.gello_joint_pos', np.zeros(8, dtype=np.float32))
+
+        assert isinstance(actions, np.ndarray), f"Expected numpy array for actions, got {type(actions)}"
+        assert actions.shape == (24,), f"Expected 24-dim action vector (16 hand + 8 gello), got shape {actions.shape}"
+        hand_actions = actions[:16]
+        gello_actions = actions[16:24]
+
+        # Ensure types
+        hand_actions = np.asarray(hand_actions, dtype=np.float32)
+        gello_actions = np.asarray(gello_actions, dtype=np.float32)
+
+        gello_deltas = gello_actions[:7] - self._last_xarm_joints
+        
+        # Visualization: store predicted deltas for first 7 joints
+        self.predicted_coordinates = gello_deltas
+
+        # Send hand commands (16 DOF) + wrist via ROS2 (if available)
+        if self.hand_controller is not None:
+            # Extract wrist command from gello_actions (if available) or use current wrist state
+            wrist_cmd = None
+            if len(gello_actions) >= 8:  # gello has 8 DOF, 8th might be wrist
+                wrist_cmd = float(gello_actions[7])  # Use 8th gello joint as wrist command
             else:
-                assert isinstance(actions, np.ndarray), f"Expected numpy array for actions, got {type(actions)}"
-                assert actions.shape == (24,), f"Expected 24-dim action vector (16 hand + 8 gello), got shape {actions.shape}"
-                hand_actions = actions[:16]
-                gello_actions = actions[16:24]
+                # Fallback: use current wrist state if available
+                if self._last_xarm_joints is not None and hasattr(self, '_last_wrist_state'):
+                    wrist_cmd = self._last_wrist_state
+            
+            self.hand_controller.send_hand_command(hand_actions, wrist_rad=wrist_cmd)
 
-            # Ensure types
-            hand_actions = np.asarray(hand_actions, dtype=np.float32)
-            gello_actions = np.asarray(gello_actions, dtype=np.float32)
-
-            # Visualization: store predicted deltas for first 7 joints
-            self.predicted_coordinates = gello_actions[:7]
-
-            # Send hand commands (16 DOF) + wrist via ROS2 (if available)
-            if self.hand_controller is not None:
-                # Extract wrist command from gello_actions (if available) or use current wrist state
-                wrist_cmd = None
-                if len(gello_actions) >= 8:  # gello has 8 DOF, 8th might be wrist
-                    wrist_cmd = float(gello_actions[7])  # Use 8th gello joint as wrist command
-                else:
-                    # Fallback: use current wrist state if available
-                    if self._last_xarm_joints is not None and hasattr(self, '_last_wrist_state'):
-                        wrist_cmd = self._last_wrist_state
-                
-                self.hand_controller.send_hand_command(hand_actions, wrist_rad=wrist_cmd)
-
-            # Send xArm joint command via UDP to child process (absolute 8-dim: 7 joints + 1 gripper placeholder)
-            if self.xarm_cmd_sender is not None:
-                # Need current joints to convert predicted delta -> absolute target
-                if self._last_xarm_joints is None:
-                    # No valid current joints yet; skip this action safely
-                    return
-                # gello_actions[:7] are deltas; compose absolute target
-                abs_target = (self._last_xarm_joints + gello_actions[:7]).astype(np.float32)
-                # length-8 vector: joints + gripper placeholder (0.0)
-                cmd = np.concatenate([abs_target, np.array([0.0], dtype=np.float32)], axis=0)
-                # send over UDP
-                self.xarm_cmd_sender.send([cmd.tolist()])
-
-        except Exception as e:
-            print(f"Error executing actions: {e}")
+        # Send xArm joint command via UDP to child process (absolute 8-dim: 7 joints + 1 gripper placeholder)
+        if self.xarm_cmd_sender is not None:
+            # Need current joints to convert predicted delta -> absolute target
+            if self._last_xarm_joints is None:
+                # No valid current joints yet; skip this action safely
+                return
+            # Use the processed deltas from above
+            abs_target = (self._last_xarm_joints + gello_deltas).astype(np.float32)
+            # length-8 vector: joints + gripper placeholder (0.0)
+            cmd = np.concatenate([abs_target, np.array([0.0], dtype=np.float32)], axis=0)
+            # send over UDP
+            self.xarm_cmd_sender.send([cmd.tolist()])
 
     # ---------------- Visualization ----------------
 
@@ -891,7 +855,6 @@ class DiffusionPolicyRollout:
         font = pygame.font.Font(None, 36)
         small_font = pygame.font.Font(None, 24)
 
-        print("Visualization thread started...")
 
         frame_count = 0
         while self.running:
@@ -968,7 +931,7 @@ class DiffusionPolicyRollout:
                     screen.blit(pred_text, (pred_panel_x + 10, pred_panel_y + y_offset + i * 25))
 
             # Status information
-            status_text = f"Step: {self.step_count} | Coord History: {len(self.coordinate_history)}"
+            status_text = f"Step: {self.step_count}"
             status_surface = small_font.render(status_text, True, BLACK)
             screen.blit(status_surface, (20, screen.get_height() - 30))
 
@@ -978,7 +941,6 @@ class DiffusionPolicyRollout:
             clock.tick(30)  # 30 FPS
 
         pygame.quit()
-        print("Visualization thread stopped")
 
     # ---------------- Main loop ----------------
 
@@ -1015,7 +977,7 @@ class DiffusionPolicyRollout:
             self.camera_system.start()
             # restart_put after starting
             self.camera_system.restart_put(time.time() + 1)
-            time.sleep(3)  # Let cameras warm up
+            time.sleep(5)  # Let cameras warm up
 
             # Check if cameras are ready
             if not self.camera_system.is_ready:
@@ -1052,7 +1014,7 @@ class DiffusionPolicyRollout:
             while time.time() - start_time < duration:
                 loop_start = time.time()
 
-                # Get camera observations
+                # Get camera observations with timeout handling
                 images = {}
                 try:
                     cameras_output = self.camera_system.get(k=1)
@@ -1069,10 +1031,16 @@ class DiffusionPolicyRollout:
                                 assert color_data.shape[2] == 3, f"Expected 3 color channels, got {color_data.shape[2]}"
 
                                 images[serial] = {'color': color_data}
+                except TimeoutError as e:
+                    # Camera timeout - continue without images this step
+                    if self.step_count % 100 == 0:  # Print occasionally 
+                        print(f"Camera timeout (step {self.step_count}): {e}")
+                    images = {}
                 except Exception as e:
-                    if self.step_count % 100 == 0:  # Only print occasionally to avoid spam
-                        print(f"Warning: Failed to get camera data: {e}")
-                    images = {}  # Continue without camera data
+                    # Other camera errors - continue without images
+                    if self.step_count % 100 == 0:
+                        print(f"Camera error (step {self.step_count}): {e}")
+                    images = {}
 
                 # Get robot state
                 robot_state = self.get_robot_state()
@@ -1107,60 +1075,28 @@ class DiffusionPolicyRollout:
                     combined_state = np.concatenate([xarm_joints, hand_joints])  # (24,)
                     state_tensor = torch.from_numpy(combined_state).float()
 
-                    # Cache latest single-step obs (no history stacking here)
+                    # Cache latest single-step obs
                     self.latest_obs = {**processed_images, 'observation.state': state_tensor}
 
                     # Select action (policy keeps its own n_obs_steps queue)
-                    try:
-                        batch = self.create_step_batch()
-                        if batch is not None:
-                            with torch.no_grad():
-                                action = self.policy.select_action(batch)
+                    batch = self.create_step_batch()
+                    if batch is not None:
+                        with torch.no_grad():
+                            action = self.policy.select_action(batch)
+                            
+                            # Convert to numpy 
+                            action = action.detach().cpu().numpy()
+                            
 
-                            # IMPORTANT: Unnormalize policy outputs BEFORE converting to numpy
-                            # This was missing and causing huge deltas like 1.313 radians!
-                            if hasattr(self.policy, 'unnormalize_outputs') and isinstance(action, torch.Tensor):
-                                try:
-                                    # Unnormalize while still tensor on correct device
-                                    unnormalized = self.policy.unnormalize_outputs({"action": action})
-                                    action = unnormalized["action"]
-                                    print(f"[DEBUG] Step {self.step_count}: Unnormalized action successfully")
-                                except Exception as e:
-                                    print(f"[WARNING] Step {self.step_count}: Failed to unnormalize actions: {e}")
-                                    print("Using raw normalized actions - this may cause large movements!")
-                            elif not hasattr(self.policy, 'unnormalize_outputs'):
-                                print(f"[WARNING] Step {self.step_count}: Policy has no unnormalize_outputs method - using raw actions")
-                            
-                            # Convert to numpy after unnormalization
-                            if isinstance(action, torch.Tensor):
-                                action = action.detach().cpu().numpy()
-                            
-                            print(f"[DEBUG] Step {self.step_count}: Raw action shape: {action.shape}")
-                            
-                            # Handle different policy output formats
-                            if action.ndim == 3:
-                                # Shape: (batch, action_horizon, action_dim) - typical for diffusion policies
-                                assert action.shape[0] == 1, f"Expected batch size 1, got {action.shape[0]}"
-                                action_sequence = action[0]  # Remove batch dimension: (action_horizon, action_dim)
-                                current_action = action_sequence[0]  # First action for immediate execution
-                                print(f"[DEBUG] Step {self.step_count}: Action sequence shape: {action_sequence.shape}")
-                            elif action.ndim == 2:
-                                if action.shape[0] == 1:
-                                    # Shape: (1, action_dim) - single action
-                                    current_action = action[0]
-                                    action_sequence = action[0:1]  # Keep as sequence of 1
-                                else:
-                                    # Shape: (action_horizon, action_dim) - sequence without batch
-                                    action_sequence = action
-                                    current_action = action[0]
-                                print(f"[DEBUG] Step {self.step_count}: Action sequence shape: {action_sequence.shape}")
-                            elif action.ndim == 1:
-                                # Shape: (action_dim,) - single action
-                                current_action = action
-                                action_sequence = action.reshape(1, -1)  # Convert to sequence of 1
-                                print(f"[DEBUG] Step {self.step_count}: Single action converted to sequence: {action_sequence.shape}")
+                            if action.shape[0] == 1:
+                                # Shape: (1, action_dim) - single action
+                                current_action = action[0]
+                                action_sequence = action[0:1]  # Keep as sequence of 1
                             else:
-                                raise ValueError(f"Unexpected action shape: {action.shape}")
+                                # Shape: (action_horizon, action_dim) - sequence without batch
+                                action_sequence = action
+                                current_action = action[0]
+
                             
                             assert current_action.ndim == 1 and current_action.shape[0] == 24, f"Expected 24-dim current action, got {current_action.shape}"
                             
@@ -1169,7 +1105,8 @@ class DiffusionPolicyRollout:
                                 # Extract current action for immediate execution
                                 hand_actions = current_action[:16]
                                 gello_actions = current_action[16:24]
-                                predicted_joints = self._last_xarm_joints + gello_actions[:7]  # Add deltas to current joints
+                                # Policy outputs absolute positions, so use them directly
+                                predicted_joints = gello_actions[:7]
                                 
                                 # Start with original images
                                 annotated_images = images.copy()
@@ -1177,10 +1114,10 @@ class DiffusionPolicyRollout:
                                 # Draw current end effector frame (for debugging)
                                 annotated_images = self.draw_end_effector_frame(annotated_images, self._last_xarm_joints, is_predicted=False)
                                 
-                                # ALWAYS show trajectory visualization (blocking)
-                                print(f"[VIZ] Showing trajectory with {action_sequence.shape[0]} action steps")
+                                # Show trajectory visualization (blocking)
                                 # Call the blocking 3D visualization directly
-                                self.draw_trajectory_3d_window(action_sequence, self._last_xarm_joints)
+                                if self.debug:
+                                    self.draw_trajectory_3d_window(action_sequence, self._last_xarm_joints)
                                 
                                 # Draw immediate next frame (first predicted step) on top of everything
                                 annotated_images = self.draw_end_effector_frame(annotated_images, predicted_joints, is_predicted=True)
@@ -1195,8 +1132,6 @@ class DiffusionPolicyRollout:
                                     self.display_queue.append(display_data)
                             
                             self.execute_actions(current_action)
-                    except Exception as e:
-                        print(f"Error in select_action step: {e}")
 
                 elif not images and self.step_count % 100 == 0:
                     print("Warning: No camera data available, skipping action step")
@@ -1208,13 +1143,12 @@ class DiffusionPolicyRollout:
                     elapsed = time.time() - start_time
                     has_images = len(images) > 0
                     has_robot_state = robot_state is not None
-                    print(f"Step {self.step_count}, Elapsed: {elapsed:.1f}s, "
-                          f"Coord history: {len(self.coordinate_history)}, "
+                    print(f"Step {self.step_count}, Elapsed: {elapsed:.1f}s"
                           f"Images: {has_images}, Robot state: {has_robot_state}")
 
                 # Maintain loop rate
                 loop_time = time.time() - loop_start
-                target_dt = 1.0 / 30.0  # 30 Hz
+                target_dt = 1.0 / 20.0  # 20 Hz
                 if loop_time < target_dt:
                     time.sleep(target_dt - loop_time)
 
@@ -1273,15 +1207,17 @@ def main():
     parser.add_argument("--duration", type=float, default=1000,
                        help="Rollout duration in seconds")
     parser.add_argument("--camera_serials", type=str, nargs="+", default=["239222300740", "239222303153"],
-                       help="Camera serial numbers (uses auto-detection if not specified)")
+                       help="Camera serial numbers, Cam0 and Cam1")
     parser.add_argument("--image_width", type=int, default=424,
                        help="Image width for policy input (default: 424)  [will be overridden by policy config]")
     parser.add_argument("--image_height", type=int, default=240,
                        help="Image height for policy input (default: 240) [will be overridden by policy config]")
     parser.add_argument("--device", type=str, default="cuda",
                        help="Device for policy inference (cuda/cpu)")
-    parser.add_argument("--verbose", type=bool, default= False,
+    parser.add_argument("--verbose", type=bool, default= True,
                        help="Enable verbose logging")
+    parser.add_argument("--debug", type=bool, default= False,
+                    help="Enable debug")
     parser.add_argument("--no_visualization", action="store_true",
                        help="Disable real-time visualization window")
 
@@ -1293,10 +1229,9 @@ def main():
         exp_name=args.exp_name,
         robot_ip=args.robot_ip,
         camera_serial_numbers=args.camera_serials,
-        image_width=args.image_width,
-        image_height=args.image_height,
         device=args.device,
-        verbose=args.verbose
+        verbose=args.verbose,
+        debug = args.debug
     )
 
     # Set visualization flag
@@ -1316,3 +1251,17 @@ def main():
 
 if __name__ == "__main__":
     exit(main())
+
+
+'''
+  Observations (inputs to the policy):
+  1. observation.images.cam_0 - RGB camera 0 image(240x424x3)
+  2. observation.images.cam_1 - RGB camera 1 image(240x424x3)
+  3. observation.state - 24-dimensional vector containing:
+    - XArm7 joint positions ( 7 values)                 0  1  2  3  4  5  6                            wrist
+    - Hand  joint positions (17 values including wrist) 7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22    23
+  Actions (outputs from the policy):                                                  
+  - XArm joint actions ( 8 values including wrist)     16 17 18 19 20 21 22                               23 
+  - Hand joint actions (16 values)                      0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 
+
+'''

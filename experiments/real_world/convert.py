@@ -212,7 +212,7 @@ def convert_recording_to_lerobot(
     
     # The stable period is from the latest start to the earliest end, minus last 1 second
     stable_start = max(all_start_times)
-    stable_end = min(all_end_times) - 2.2  # Exclude last 1 second
+    stable_end = min(all_end_times) - 2  # Exclude last 1 second
     
     logger.info(f"Data overlap period: {stable_start:.3f} to {stable_end:.3f} ({stable_end - stable_start:.3f}s)")
     
@@ -467,7 +467,7 @@ def main():
                        help='Data configuration ID (0, 1, 2, or 99)')
     parser.add_argument('--output_repo_id', type=str, default="xarm_manipulation_direct",
                        help='Repository ID for the output LeRobot dataset')
-    parser.add_argument('--output_root', type=str, default="/data/local_datasets",
+    parser.add_argument('--output_root', type=str, default="/data/lerobot_datasets",
                        help='Root directory for output dataset')
     parser.add_argument('--num_cams', type=int, default=2,
                        help='Number of cameras (default: 2)')
@@ -519,7 +519,7 @@ def main():
     # Use provided repo_id or default name
     repo_id = args.output_repo_id
     
-    output_root = Path(args.output_root).resolve() if args.output_root else Path("./local_datasets").resolve()
+    output_root = Path(args.output_root).resolve() if args.output_root else Path("./lerobot_datasets").resolve()
     
     logger.info(f"Configuration: data_id={ii}, num_cams={num_cams}, bimanual={bimanual}")
     logger.info(f"Output repo_id: {repo_id}")

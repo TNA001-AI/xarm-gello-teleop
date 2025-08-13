@@ -204,7 +204,7 @@ def main():
         epilog="""
 Examples:
   # Convert specific topic to text
-  python ros2bag_to_text.py --bag_path ros2_bag/rosbag2_2025_01_23_12_34_56 --topic /orca_hand/joint_angles
+   python experiments/real_world/ros2bag_to_text.py --bag_path /home/yolandazhu/xarm-gello-teleop/experiments/log/data/test/r0/ros2_bag/hand_joint_angles_1755105918
   
   # Convert all topics in bag
   python ros2bag_to_text.py --bag_path ros2_bag/rosbag2_2025_01_23_12_34_56
