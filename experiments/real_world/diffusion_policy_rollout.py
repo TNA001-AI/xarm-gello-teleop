@@ -72,7 +72,7 @@ try:
     from sensor_msgs.msg import JointState
     from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 except ImportError:
-    print("Warning: ROS2 not available, hand control disabled")
+    print("Warning: ROS2 not available, hand control disabled, please:\n source /opt/ros/humble/setup.bash ")
     ROS2_AVAILABLE = False
 
 # LeRobot imports
@@ -87,7 +87,7 @@ except ImportError:
 
 # ------------------------------------------------------------------------------
 
-CHECK_POINT_PATH = "/data/xarm_orca_diffusion_2/checkpoints/last/pretrained_model"
+CHECK_POINT_PATH = "/data/xarm_orca_diffusion_2/checkpoints/190000/pretrained_model"
 
 # ------------------------------------------------------------------------------
 
@@ -611,7 +611,7 @@ class DiffusionPolicyRollout:
             return images
 
 
-    def draw_trajectory_3d_window(self, action_sequence: np.ndarray, current_joints: np.ndarray):
+    def draw_trajectory_3d_window(self, action_sequence, current_joints: np.ndarray):
         """
         Display trajectory in a BLOCKING Open3D window showing all 16 trajectory points.
         Window will pause execution until closed.
@@ -623,7 +623,17 @@ class DiffusionPolicyRollout:
         try:
             import open3d as o3d
             
-            # Compute ALL 16 trajectory points (or however many are in action_sequence)
+            # Convert action_sequence to numpy array if it's a list
+            if isinstance(action_sequence, list):
+                if len(action_sequence) == 0:
+                    print("[3D TRAJECTORY] Empty action sequence list, skipping")
+                    return  # No actions to visualize
+                action_sequence = np.stack(action_sequence)
+            # Squeeze extra dimensions to ensure we have (n, 24) shape
+            if action_sequence.ndim == 3 and action_sequence.shape[1] == 1:
+                action_sequence = action_sequence.squeeze(1)
+            
+            # Compute ALL trajectory points (or however many are in action_sequence)
             trajectory_points = []
             trajectory_frames = []
 
@@ -638,6 +648,7 @@ class DiffusionPolicyRollout:
             
             # Compute trajectory points
             num_steps = action_sequence.shape[0]  # Use all available steps
+            # print(f"[3D TRAJECTORY] Computing {num_steps} trajectory steps")
             
             for step_idx in range(num_steps):
                 gello_joints = action_sequence[step_idx, 16:24][:7]
@@ -662,34 +673,36 @@ class DiffusionPolicyRollout:
             geometries.append(base_frame)
             
             
-            
-            # 3. Current/Start end effector frame (green)
-            current_ee_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)
-            current_ee_frame.transform(trajectory_frames[0])
-            current_ee_frame.paint_uniform_color([0, 1, 0])
-            geometries.append(current_ee_frame)
-            
-        
-            
-            # 4. Final/End end effector frame (red)
-            if len(trajectory_frames) > 1:
-                final_ee_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)
-                final_ee_frame.transform(trajectory_frames[-1])
-                final_ee_frame.paint_uniform_color([1, 0, 0])
-                geometries.append(final_ee_frame)
+            # 3. ALL trajectory frames with different colors
+            for i, frame in enumerate(trajectory_frames):
+                ee_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.05)
+                ee_frame.transform(frame)
                 
+                if i == 0:
+                    # Current/Start frame (green)
+                    ee_frame.paint_uniform_color([0, 1, 0])
+                elif i == len(trajectory_frames) - 1:
+                    # Final frame (red)
+                    ee_frame.paint_uniform_color([1, 0, 0])
+                else:
+                    # Intermediate frames (gradient from yellow to orange)
+                    ratio = i / (len(trajectory_frames) - 1)
+                    color = [1, 1 - ratio * 0.5, 0]  # Yellow to orange gradient
+                    ee_frame.paint_uniform_color(color)
                 
-
+                geometries.append(ee_frame)
+                
             
             # BLOCKING visualization - execution will pause until window is closed
             if self.verbose:
                 print(f"[3D TRAJECTORY] Opening BLOCKING Open3D window with {len(geometries)} geometries")
                 print(f"[3D TRAJECTORY] Showing all {len(trajectory_points)} trajectory points")
-                print("[3D TRAJECTORY] Frame Labels: WORLD=Yellow, BASE=Cyan, START=Green, END=Red")
+                print("[3D TRAJECTORY] Frame Colors: BASE=Cyan, START=Green, INTERMEDIATE=Yellow-Orange, END=Red")
+                print("[3D TRAJECTORY] Blue line shows trajectory path")
                 print("[3D TRAJECTORY] Close the window to continue execution...")
             
             # Use blocking draw_geometries - this will pause execution
-            window_title = (f"Robot Trajectory Visualization | Step {self.step_count} ")
+            window_title = (f"Robot Trajectory ({len(trajectory_points)} points) | Step {self.step_count}")
             
             # Create visualizer with custom view settings
             vis = o3d.visualization.Visualizer()
@@ -723,8 +736,7 @@ class DiffusionPolicyRollout:
             
             
         except Exception as e:
-            if self.verbose:
-                print(f"[3D TRAJECTORY ERROR] {e}")
+            print(f"[3D TRAJECTORY ERROR] {e}")
 
     def preprocess_images_single(self, images: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
         """
@@ -892,8 +904,8 @@ class DiffusionPolicyRollout:
                     self.running = False
                     return
                 elif event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_ESCAPE:
-                        print("ESC pressed - Shutting down safely...")
+                    if event.key == pygame.K_SPACE:
+                        print("SPACE pressed - Shutting down safely...")
                         self.running = False
                         return
 
@@ -1038,7 +1050,7 @@ class DiffusionPolicyRollout:
             print("Visualization disabled")
 
         print("Starting main rollout loop...")
-        print("Press ESC in the visualization window or Ctrl+C to stop safely")
+        print("Press SPACE in the visualization window or Ctrl+C to stop safely")
         start_time = time.time()
 
         try:
@@ -1118,22 +1130,21 @@ class DiffusionPolicyRollout:
                     batch = self.create_step_batch()
                     if batch is not None:
                         with torch.inference_mode():
-                            action = self.policy.select_action(batch)
+                            action, action_sequence= self.policy.select_action(batch)
                             
                             # Convert to numpy 
                             action = action.detach().cpu().numpy()
                             
-
-                            if action.shape[0] == 1:
-                                # Shape: (1, action_dim) - single action
-                                current_action = action[0]
-                                action_sequence = action[0:1]  # Keep as sequence of 1
+                            # Convert action_sequence (list of tensors) to numpy array
+                            if action_sequence and len(action_sequence) > 0:
+                                action_sequence_np = np.array([a.detach().cpu().numpy() for a in action_sequence])
                             else:
-                                # Shape: (action_horizon, action_dim) - sequence without batch
-                                action_sequence = action
-                                current_action = action[0]
+                                action_sequence_np = np.array([])
 
-                            
+                            assert action.shape[0] == 1
+                            # Shape: (1, action_dim) - single action
+                            current_action = action[0]
+
                             assert current_action.ndim == 1 and current_action.shape[0] == 24, f"Expected 24-dim current action, got {current_action.shape}"
                             
                             # Visualize current frame, predicted trajectory, and immediate next frame
@@ -1153,7 +1164,11 @@ class DiffusionPolicyRollout:
                                 # Show trajectory visualization (blocking) - THIS IS THE BOTTLENECK!
                                 # Call the blocking 3D visualization directly
                                 if self.debug:
-                                    self.draw_trajectory_3d_window(action_sequence, self._last_xarm_joints)
+                                    if action_sequence_np.size > 0:
+                                        viz_sequence = action_sequence_np
+                                    else:
+                                        viz_sequence = current_action[np.newaxis, :]
+                                    self.draw_trajectory_3d_window(viz_sequence, self._last_xarm_joints)
                                 
                                 # Draw immediate next frame (first predicted step) on top of everything
                                 annotated_images = self.draw_end_effector_frame(annotated_images, predicted_joints, is_predicted=True)
@@ -1173,14 +1188,6 @@ class DiffusionPolicyRollout:
                     print("Warning: No camera data available, skipping action step")
 
                 self.step_count += 1
-
-                # Print status every 100 steps
-                if self.debug and self.step_count % 100 == 0:
-                    elapsed = time.time() - start_time
-                    has_images = len(images) > 0
-                    has_robot_state = robot_state is not None
-                    print(f"Step {self.step_count}, Elapsed: {elapsed:.1f}s")
-                    print(f"  Images: {has_images}, Robot: {has_robot_state}")
 
                 # Maintain loop rate
                 loop_time = time.time() - loop_start

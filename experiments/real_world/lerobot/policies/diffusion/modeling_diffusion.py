@@ -145,7 +145,7 @@ class DiffusionPolicy(PreTrainedPolicy):
             self._queues[ACTION].extend(actions.transpose(0, 1))
 
         action = self._queues[ACTION].popleft()
-        return action
+        return action, list(self._queues[ACTION])
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, None]:
         """Run the batch through the model and compute the loss for training or validation."""
