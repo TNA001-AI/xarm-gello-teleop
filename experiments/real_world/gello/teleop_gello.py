@@ -123,7 +123,7 @@ class GelloListener(mp.Process):
         self.wrist = True
         self.gello_port = gello_port
         self.should_calibrate_offset = False  # whether to recalibrate the offset
-        self.verbose = True
+        self.verbose = False
         self.gripper = False
 
         if bimanual:
@@ -272,7 +272,7 @@ class GelloListener(mp.Process):
 
         self.ready_event.set()
     
-    def calibrate_offset(self, port, gripper_enable=True, verbose=True):
+    def calibrate_offset(self, port, gripper_enable=True, verbose=False):
         # MENAGERIE_ROOT = Path(__file__).parent / "third_party" / "mujoco_menagerie"
         
         start_joints = tuple(np.deg2rad([0, -45, 0, 30, 0, 75, 0]))  # The joint angles that the GELLO is placed in at (in radians)

@@ -6,6 +6,7 @@ This script rolls out a trained diffusion policy to control both xArm and hand s
 Uses the existing teleoperation infrastructure for camera capture and robot control.
 
 Usage:
+    source /opt/ros/humble/setup.bash
     python experiments/real_world/diffusion_policy_rollout.py \
         --policy_path /path/to/policy.safetensors \
         --exp_name my_rollout \
@@ -37,6 +38,7 @@ import torch
 import cv2
 import pygame
 from collections import deque
+from termcolor import colored
 
 # Add project root to path
 sys.path.append(str(Path(__file__).parent))
@@ -61,7 +63,6 @@ except ImportError as e:
 from modules_teleop.udp_util import udpSender
 from modules_teleop.common.communication import XARM_CONTROL_PORT_L, XARM_CONTROL_PORT_R
 
-CHECK_POINT_PATH = "/data/xarm_orca_diffusion/checkpoints/last/pretrained_model"
 
 # ROS2 imports for hand control
 try:
@@ -77,16 +78,18 @@ except ImportError:
 # LeRobot imports
 try:
     from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
-    from lerobot.policies.factory import make_policy
-    from lerobot.configs.policies import PreTrainedConfig
-    from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
-    from lerobot.datasets.factory import resolve_delta_timestamps
-    from typing import Optional, Dict, Any
+    from typing import Optional, Dict
     LEROBOT_AVAILABLE = True
 except ImportError:
     print("Warning: LeRobot not available")
     LEROBOT_AVAILABLE = False
 
+
+# ------------------------------------------------------------------------------
+
+CHECK_POINT_PATH = "/data/xarm_orca_diffusion_2/checkpoints/last/pretrained_model"
+
+# ------------------------------------------------------------------------------
 
 class HandController(Node):
     """
@@ -107,6 +110,7 @@ class HandController(Node):
     """
 
     # Exact publish order expected by your hardware on /joint_states (16 dims)
+    # Action
     RIGHT_NAMES_16 = [
         "right_thumb_mcp", "right_thumb_abd", "right_thumb_pip", "right_thumb_dip",
         "right_index_mcp", "right_index_pip", "right_index_abd",
@@ -114,7 +118,24 @@ class HandController(Node):
         "right_ring_mcp", "right_ring_pip", "right_ring_abd",
         "right_pinky_mcp", "right_pinky_pip", "right_pinky_abd",
     ]
-
+    OBS_NAMES_17 =[
+            'thumb_mcp', 'thumb_abd', 'thumb_pip', 'thumb_dip',
+            'index_mcp', 'index_pip', 'index_abd', 
+            'middle_abd', 'middle_mcp', 'middle_pip', 
+            'ring_mcp', 'ring_pip', 'ring_abd', 
+            'pinky_mcp', 'pinky_pip', 'pinky_abd', 'wrist'
+    ]
+    Action_OBS_MAP = {
+            'right_thumb_mcp': 'thumb_mcp', 'right_thumb_abd': 'thumb_abd',
+            'right_thumb_pip': 'thumb_pip', 'right_thumb_dip': 'thumb_dip',
+            'right_index_mcp': 'index_mcp', 'right_index_pip': 'index_pip',
+            'right_index_abd': 'index_abd', 
+            'right_middle_abd': 'middle_abd','right_middle_mcp': 'middle_mcp',
+            'right_middle_pip': 'middle_pip', 'right_ring_mcp': 'ring_mcp',
+            'right_ring_pip': 'ring_pip', 'right_ring_abd': 'ring_abd',
+            'right_pinky_mcp': 'pinky_mcp', 'right_pinky_pip': 'pinky_pip',
+            'right_pinky_abd': 'pinky_abd', 'right_wrist': 'wrist'
+        }
     def __init__(self):
         super().__init__("hand_controller")
 
@@ -153,23 +174,17 @@ class HandController(Node):
         if not names:
             return None
 
-        name_to_pos = {n: p for n, p in zip(names, pos)}
+        # Create dictionary mapping joint names to their positions
+        name_to_pos = dict(zip(names, pos))
 
-        # Try to assemble fingers in RIGHT_NAMES_16 order
+        # Try to assemble fingers in OBS_NAMES_17 order
         try:
-            fingers = np.array([name_to_pos[n] for n in self.RIGHT_NAMES_16], dtype=np.float32)
+            hand_state_with_wrist = np.array([name_to_pos[n] for n in self.OBS_NAMES_17], dtype=np.float32)
         except KeyError:
             # Some finger names missing; return None to use zeros
             return None
-
-        # Wrist is optional; use 0.0 if not present
-        wrist = name_to_pos.get("wrist", 0.0)
-        wrist = float(wrist)
-
-        # Combine into 17 DOF: 16 fingers + 1 wrist
-        hand_state = np.concatenate([fingers, np.array([wrist], dtype=np.float32)])
         
-        return hand_state
+        return hand_state_with_wrist
 
     # -------- Command --------
     def send_hand_command(self, hand_joints: np.ndarray, wrist_rad: Optional[float] = None):
@@ -181,11 +196,20 @@ class HandController(Node):
         if hand.size != 16:
             raise ValueError(f"hand_joints must have 16 elements (got {hand.size})")
 
-        # Fingers -> /joint_states
+        # Reorder hand joints from OBS order to RIGHT_NAMES_16 order for publication
         js = JointState()
         js.header.stamp = self.get_clock().now().to_msg()
         js.name = list(self.RIGHT_NAMES_16)
-        js.position = hand.tolist()
+        
+        # Create mapping from observation order to action order
+        obs_to_pos = dict(zip(self.OBS_NAMES_17[:-1], hand))  # Exclude 'wrist' from OBS_NAMES_17
+        
+        # Build position list in RIGHT_NAMES_16 order
+        js.position = []
+        for action_name in self.RIGHT_NAMES_16:
+            obs_name = self.Action_OBS_MAP[action_name]
+            js.position.append(float(obs_to_pos[obs_name]))
+        
         self.joint_cmd_pub.publish(js)
 
         # Optional wrist -> /gello/act_joint_states (index 7)
@@ -212,7 +236,8 @@ class DiffusionPolicyRollout:
         history_length: int = 2,
         device: str = "cuda",
         verbose: bool = True,
-        debug: bool = True
+        debug: bool = True,
+        rollout_hz: float = 20.0
     ):
         self.policy_path = Path(policy_path)
         self.exp_name = exp_name
@@ -223,9 +248,10 @@ class DiffusionPolicyRollout:
         self.image_resolution = None
         self.action_horizon = action_horizon
         self.history_length = history_length
-        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+        self.device = device
         self.verbose = verbose
         self.debug = debug
+        self.rollout_hz = rollout_hz
 
         self.root = get_root(__file__)
 
@@ -286,6 +312,14 @@ class DiffusionPolicyRollout:
         try:
             # Load policy config
             self.policy = DiffusionPolicy.from_pretrained(str(self.policy_path))
+                # Verify CUDA usage
+            if self.device == "cuda":
+                if not torch.cuda.is_available():
+                    print(colored("WARNING: CUDA requested but not available, falling back to CPU", "yellow"))
+                else:
+                    print(f"Using CUDA device: {torch.cuda.get_device_name()}")
+                    print(f"CUDA memory allocated: {torch.cuda.memory_allocated() / 1024**2:.1f} MB")
+    
             self.policy.to(self.device)
             self.policy.eval()
 
@@ -592,8 +626,7 @@ class DiffusionPolicyRollout:
             # Compute ALL 16 trajectory points (or however many are in action_sequence)
             trajectory_points = []
             trajectory_frames = []
-            cumulative_joints = current_joints.copy()
-            
+
             # Add current position as starting point
             current_eef_pose = self.kin_helper.compute_fk_sapien_links(
                 current_joints, [self.kin_helper.sapien_eef_idx]
@@ -607,13 +640,10 @@ class DiffusionPolicyRollout:
             num_steps = action_sequence.shape[0]  # Use all available steps
             
             for step_idx in range(num_steps):
-                gello_deltas = action_sequence[step_idx, 16:24][:7]
-                
-                
-                cumulative_joints = cumulative_joints + gello_deltas
+                gello_joints = action_sequence[step_idx, 16:24][:7]
                 
                 eef_pose = self.kin_helper.compute_fk_sapien_links(
-                    cumulative_joints, [self.kin_helper.sapien_eef_idx]
+                    gello_joints, [self.kin_helper.sapien_eef_idx]
                 )[0]
                 
                 eef_point_world = (self.robot_base_to_world @ eef_pose @ eef_point_gripper)[:3]
@@ -797,15 +827,7 @@ class DiffusionPolicyRollout:
 
         # Send hand commands (16 DOF) + wrist via ROS2 (if available)
         if self.hand_controller is not None:
-            # Extract wrist command from gello_actions (if available) or use current wrist state
-            wrist_cmd = None
-            if len(gello_actions) >= 8:  # gello has 8 DOF, 8th might be wrist
-                wrist_cmd = float(gello_actions[7])  # Use 8th gello joint as wrist command
-            else:
-                # Fallback: use current wrist state if available
-                if self._last_xarm_joints is not None and hasattr(self, '_last_wrist_state'):
-                    wrist_cmd = self._last_wrist_state
-            
+            wrist_cmd = float(gello_actions[7])  # Use 8th gello joint as wrist command
             self.hand_controller.send_hand_command(hand_actions, wrist_rad=wrist_cmd)
 
         # Send xArm joint command via UDP to child process (absolute 8-dim: 7 joints + 1 gripper placeholder)
@@ -815,7 +837,7 @@ class DiffusionPolicyRollout:
                 # No valid current joints yet; skip this action safely
                 return
             # Use the processed deltas from above
-            abs_target = (self._last_xarm_joints + gello_deltas).astype(np.float32)
+            abs_target = (gello_actions[:7]).astype(np.float32)
             # length-8 vector: joints + gripper placeholder (0.0)
             cmd = np.concatenate([abs_target, np.array([0.0], dtype=np.float32)], axis=0)
             # send over UDP
@@ -862,6 +884,11 @@ class DiffusionPolicyRollout:
                 if event.type == pygame.QUIT:
                     self.running = False
                     return
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        print("ESC pressed - Shutting down safely...")
+                        self.running = False
+                        return
 
             screen.fill(WHITE)
 
@@ -1004,6 +1031,7 @@ class DiffusionPolicyRollout:
             print("Visualization disabled")
 
         print("Starting main rollout loop...")
+        print("Press ESC in the visualization window or Ctrl+C to stop safely")
         start_time = time.time()
 
         try:
@@ -1011,7 +1039,7 @@ class DiffusionPolicyRollout:
             if hasattr(self.policy, 'reset'):
                 self.policy.reset()
 
-            while time.time() - start_time < duration:
+            while time.time() - start_time < duration and self.running:
                 loop_start = time.time()
 
                 # Get camera observations with timeout handling
@@ -1078,10 +1106,11 @@ class DiffusionPolicyRollout:
                     # Cache latest single-step obs
                     self.latest_obs = {**processed_images, 'observation.state': state_tensor}
 
-                    # Select action (policy keeps its own n_obs_steps queue)
+                    # Select action
+
                     batch = self.create_step_batch()
                     if batch is not None:
-                        with torch.no_grad():
+                        with torch.inference_mode():
                             action = self.policy.select_action(batch)
                             
                             # Convert to numpy 
@@ -1114,7 +1143,7 @@ class DiffusionPolicyRollout:
                                 # Draw current end effector frame (for debugging)
                                 annotated_images = self.draw_end_effector_frame(annotated_images, self._last_xarm_joints, is_predicted=False)
                                 
-                                # Show trajectory visualization (blocking)
+                                # Show trajectory visualization (blocking) - THIS IS THE BOTTLENECK!
                                 # Call the blocking 3D visualization directly
                                 if self.debug:
                                     self.draw_trajectory_3d_window(action_sequence, self._last_xarm_joints)
@@ -1139,23 +1168,31 @@ class DiffusionPolicyRollout:
                 self.step_count += 1
 
                 # Print status every 100 steps
-                if self.step_count % 100 == 0:
+                if self.debug and self.step_count % 100 == 0:
                     elapsed = time.time() - start_time
                     has_images = len(images) > 0
                     has_robot_state = robot_state is not None
-                    print(f"Step {self.step_count}, Elapsed: {elapsed:.1f}s"
-                          f"Images: {has_images}, Robot state: {has_robot_state}")
+                    print(f"Step {self.step_count}, Elapsed: {elapsed:.1f}s")
+                    print(f"  Images: {has_images}, Robot: {has_robot_state}")
 
                 # Maintain loop rate
                 loop_time = time.time() - loop_start
-                target_dt = 1.0 / 20.0  # 20 Hz
+                target_dt = 1.0 / self.rollout_hz  # Use configurable Hz
                 if loop_time < target_dt:
                     time.sleep(target_dt - loop_time)
+                elif not self.debug:  # Only show warning when not in debug mode
+                    delta = loop_time - target_dt
+                    if abs(delta) > 0.01:
+                        print(colored(f"Warning: Loop time exceeded target! Delta: {delta:.4f}s (Target: {self.rollout_hz} Hz)", "yellow"))
 
         except KeyboardInterrupt:
-            print("Rollout interrupted by user")
+            print("\nRollout interrupted by user (Ctrl+C)")
+            self.running = False
 
         finally:
+            # Check if stopped by ESC or other means
+            if not self.running:
+                print("Shutting down gracefully...")
             self.cleanup()
 
     # ---------------- Cleanup ----------------
@@ -1208,18 +1245,17 @@ def main():
                        help="Rollout duration in seconds")
     parser.add_argument("--camera_serials", type=str, nargs="+", default=["239222300740", "239222303153"],
                        help="Camera serial numbers, Cam0 and Cam1")
-    parser.add_argument("--image_width", type=int, default=424,
-                       help="Image width for policy input (default: 424)  [will be overridden by policy config]")
-    parser.add_argument("--image_height", type=int, default=240,
-                       help="Image height for policy input (default: 240) [will be overridden by policy config]")
     parser.add_argument("--device", type=str, default="cuda",
                        help="Device for policy inference (cuda/cpu)")
-    parser.add_argument("--verbose", type=bool, default= True,
+    parser.add_argument("--rollout_hz", type=float, default=15.0,
+                    help="Rollout frequency in Hz (default: 15 Hz)")
+    parser.add_argument("--verbose", type=bool, default=False,
                        help="Enable verbose logging")
-    parser.add_argument("--debug", type=bool, default= False,
-                    help="Enable debug")
+    parser.add_argument("--debug", type=bool, default=False,
+                       help="Enable debug (Open3D)")
     parser.add_argument("--no_visualization", action="store_true",
                        help="Disable real-time visualization window")
+
 
     args = parser.parse_args()
 
@@ -1231,7 +1267,8 @@ def main():
         camera_serial_numbers=args.camera_serials,
         device=args.device,
         verbose=args.verbose,
-        debug = args.debug
+        debug = args.debug,
+        rollout_hz=args.rollout_hz
     )
 
     # Set visualization flag

@@ -45,8 +45,8 @@ from lerobot.utils.utils import (
 )
 from lerobot.utils.wandb_utils import WandBLogger
 ## --------------------------------------- ##
-TOLERANCE_S = 0.05
-STEPS = 100000
+TOLERANCE_S = 0.04
+STEPS = 200000
 BATCH_SIZE = 64
 NUM_WORKERS = 8
 DATASET_ROOT = "/data/lerobot_datasets"
@@ -338,7 +338,10 @@ def main():
         device="cuda",
         repo_id="xarm-gello-diffusion-policy",  # Required for hub upload
         crop_shape= (224,224),
-        vision_backbone="resnet34"
+        vision_backbone="resnet34",
+        push_to_hub= False,
+        noise_scheduler_type = "DDIM",
+        num_inference_steps = 16
     )
     
     # Main training configuration
@@ -346,12 +349,12 @@ def main():
         dataset=dataset_config,
         policy=policy_config,
         wandb=wandb_config,
-        output_dir=Path("/data/xarm_orca_diffusion"),
-        job_name="xarm-gello-diffusion",
+        output_dir=Path("/data/xarm_orca_diffusion_2"),
+        job_name="xarm-gello-diffusion-2",
         seed=42,
         steps=STEPS,  # Total training steps
         log_freq=50,  # Log every 50 steps
-        save_freq=5000,  # Save checkpoint every 1000 steps
+        save_freq=10000,  # Save checkpoint every 1000 steps
         save_checkpoint=True,
         batch_size=BATCH_SIZE,  # Increased for better GPU utilization
         num_workers = NUM_WORKERS,  # Set to 0 to disable multiprocessing

@@ -116,7 +116,7 @@ class XarmController(mp.Process):
         command_mode="cartesian",
         gripper_enable=False,
         speed=50,  # mm/s
-        verbose=True,
+        verbose=False,
     ):
         
         self.robot_id = robot_id
@@ -614,6 +614,6 @@ if __name__ == "__main__":
         start_time=start_time,
         gripper_enable=False,
         z_plane_height=434,
-        verbose=True,)
+        verbose=False,)
     controller.start()
     controller.join()
