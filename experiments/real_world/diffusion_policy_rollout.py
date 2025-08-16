@@ -829,6 +829,13 @@ class DiffusionPolicyRollout:
         if self.hand_controller is not None:
             wrist_cmd = float(gello_actions[7])  # Use 8th gello joint as wrist command
             self.hand_controller.send_hand_command(hand_actions, wrist_rad=wrist_cmd)
+            
+            # Spin once to actually publish the messages
+            try:
+                rclpy.spin_once(self.hand_controller, timeout_sec=0.001)
+            except Exception as e:
+                if self.verbose:
+                    print(f"[ROS2 SPIN ERROR during publish] {e}")
 
         # Send xArm joint command via UDP to child process (absolute 8-dim: 7 joints + 1 gripper placeholder)
         if self.xarm_cmd_sender is not None:
