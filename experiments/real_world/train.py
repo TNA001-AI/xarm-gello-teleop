@@ -51,7 +51,7 @@ SAVE_FREQ = 25000
 BATCH_SIZE = 64
 NUM_WORKERS = 12
 DATASET_ROOT = "/home/tao/lerobot_datasets"
-OUTPUT_DIR = "/media/tao/Backup/xarm_orca_diffusion-1"
+OUTPUT_DIR = "/media/tao/Backup/xarm_orca_diffusion_1"
 ## --------------------------------------- ##
 class SafeDatasetWrapper(torch.utils.data.Dataset):
     """
@@ -335,31 +335,31 @@ def main():
     
     # Policy configuration
     policy_config = DiffusionConfig(
-        input_features=input_features,
-        output_features=output_features,
-        device="cuda",
-        repo_id="xarm-gello-diffusion-policy",
-        crop_shape= (216,378), # 90%
-        vision_backbone="resnet34",
-        push_to_hub= False,
+        input_features       = input_features,
+        output_features      = output_features,
+        device               ="cuda",
+        repo_id              ="xarm-gello-diffusion-policy",
+        crop_shape           = (216,378), # 90%
+        vision_backbone      ="resnet34",
+        push_to_hub          = False,
         noise_scheduler_type = "DDIM",
-        num_inference_steps = 16
+        num_inference_steps  = 16
     )
     
     # Main training configuration
     config = TrainPipelineConfig(
-        dataset=dataset_config,
-        policy=policy_config,
-        wandb=wandb_config,
-        output_dir=Path(OUTPUT_DIR),
-        job_name="xarm-gello-diffusion",
-        seed=42,
-        steps=STEPS,  # Total training steps
-        log_freq=50,  # Log every 50 steps
-        save_freq=SAVE_FREQ,  # Save checkpoint every 25000 steps
-        save_checkpoint=True,
-        batch_size=BATCH_SIZE,  # Increased for better GPU utilization
-        num_workers = NUM_WORKERS,  # Set to 0 to disable multiprocessing
+        dataset         = dataset_config,
+        policy          = policy_config,
+        wandb           = wandb_config,
+        output_dir      = Path(OUTPUT_DIR),
+        job_name        ="xarm-gello-diffusion",
+        seed            = 42,
+        steps           = STEPS,        # Total training steps
+        log_freq        = 300,           # Log every 50 steps
+        save_freq       = SAVE_FREQ,    # Save checkpoint every 25000 steps
+        save_checkpoint = True,
+        batch_size      = BATCH_SIZE,   # Increased for better GPU utilization
+        num_workers     = NUM_WORKERS,  # Set to 0 to disable multiprocessing
     )
     
     # Start training with wandb logging and custom tolerance
